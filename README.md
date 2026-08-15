@@ -1,6 +1,6 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 23 tok/s decode with a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. The card holds up to 102,400 tokens of context at this quantization.
+Qwen3.8-27B serves at 23 tok/s decode over a 98,304-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding.
 
 ```bash
 gcloud config set project <your-project>
@@ -11,24 +11,22 @@ That command creates the instance, fetches the model, starts an OpenAI-compatibl
 
 ## Architecture
 
-Qwen3.8-27B is a hybrid-attention model, which is what makes it viable on a 24 GB card. Its `config.json` reports 64 layers with `full_attention_interval` of 4, so 16 layers maintain a KV cache and the remaining 48 use linear attention. The model also ships a native MTP draft head, `mtp_num_hidden_layers` of 1, and supports positions up to 262,144.
+Qwen3.8-27B uses hybrid attention, and that is why a 27B model is practical on a 24 GB card. Its `config.json` reports 64 layers with `full_attention_interval` of 4, so 16 layers maintain a KV cache and the remaining 48 use linear attention. The model ships a native MTP draft head, `mtp_num_hidden_layers` of 1, and supports positions up to 262,144.
 
-One layer in four holding a KV cache is what removes the context ceiling that a conventional dense model of this size runs into. A genuinely dense Qwen3.5-27B at Q6_K on this same card reaches 10 tok/s and stops at 71K context. Qwen3.8-27B sustains 2.4 times that throughput at comparable context, and its context limit is set by the VRAM budget rather than by the architecture.
+Because only one layer in four holds a KV cache, context costs roughly a quarter of what it costs on a conventional dense model of this size. A genuinely dense Qwen3.5-27B at Q6_K on this same card reaches 10 tok/s and stops at 71K context. Qwen3.8-27B sustains 2.4 times that throughput while serving 98K, and its ceiling follows the VRAM budget.
 
 A sparse MoE of similar size remains faster. [Qwen3.6-35B-A3B with MTP on the same L4](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) reaches 92-100 tok/s because it activates roughly 3B parameters per token. Choose 35B-A3B for throughput and this model for a compact dense-class model with native vision.
 
 ## Serving configuration
 
 ```
---ctx-size 65536 --parallel 1 --flash-attn on -ngl 99
+--ctx-size 98304 --parallel 1 --flash-attn on -ngl 99
 -ub 64 -b 512 --no-mmap --threads 8
 --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.4
 --jinja --tools all --metrics
 ```
 
-llama.cpp divides `--ctx-size` across slots, so `--parallel 1` gives a single slot the full context instead of splitting it. The two speculative parameters are measured optima, reported in the tuning section below.
-
-The default of 65,536 leaves 3 GB of VRAM free. Raise it with `CTX=102400 bash scripts/provision-ondemand.sh` to use the full capacity measured below.
+llama.cpp divides `--ctx-size` across slots, so `--parallel 1` gives a single slot the full context instead of splitting it. The context and the two speculative parameters are measured optima, reported below. Override any of them through the environment, as in `CTX=65536 bash scripts/provision-ondemand.sh`.
 
 ECC must be disabled. Turning it off with `nvidia-smi -e 0` and rebooting returns about 1 GB of VRAM, and this configuration does not fit without it. The provisioning script performs this on first boot.
 
@@ -46,20 +44,23 @@ The instance also serves a web UI on port 8080, Prometheus metrics at `/metrics`
 
 ## Memory and context capacity
 
-Table 1 reports VRAM measured with the server loaded and idle. Weights account for 17.9 GB at every setting; the difference is the f16 KV cache for the 16 full-attention layers, the MTP draft context and compute buffers.
+Table 1 reports VRAM measured with the server loaded and idle. Weights account for 17.9 GB at every setting, and the difference is the f16 KV cache for the 16 full-attention layers, the MTP draft context and compute buffers.
 
 **Table 1: VRAM against context size, on a 24,570 MiB device.**
 
 | `--ctx-size` | VRAM used | Free |
 | --- | --- | --- |
-| 65,536 (default) | 21,500 MiB | 3,070 MiB |
+| 65,536 | 21,500 MiB | 3,070 MiB |
 | 90,112 | 23,138 MiB | 1,432 MiB |
-| **102,400 (maximum)** | **23,956 MiB** | **614 MiB** |
+| **98,304 (default here)** | **23,684 MiB** | **886 MiB** |
+| 102,400 (maximum) | 23,956 MiB | 614 MiB |
 | 105,472 | fails to serve | |
 
-`scripts/max-context.sh` locates this limit by binary search. A context counts as working only when the server both reaches `/health` and completes a generation, because llama.cpp allocates the KV cache at load time while some compute buffers are sized on the first decode. A context that loads can still fail under traffic.
+`scripts/max-context.sh` locates the ceiling by binary search. A context counts as working only when the server both reaches `/health` and completes a generation, because llama.cpp allocates the KV cache at load time while some compute buffers are sized on the first decode. A context that loads can still fail under traffic.
 
-The limit was confirmed under load rather than at idle. An 89,125-token prompt at `--ctx-size 102400` returned a correct answer, held decode at 25.4 tok/s with prefill at 293 tok/s, and peaked at 23,962 MiB.
+The default is 98,304 rather than the 102,400 maximum, which leaves 886 MiB against allocator variation across llama.cpp builds and prompt shapes. Both were verified by generation.
+
+Capacity was confirmed under load rather than at idle. An 89,125-token prompt returned a correct answer, held decode at 25.4 tok/s with prefill at 293 tok/s, and peaked at 23,962 MiB.
 
 ## Performance
 
@@ -77,7 +78,7 @@ Table 2 reports decode throughput from `scripts/bench.sh`, run on the instance u
 | prose | 22.96 | 0.736 |
 | json | 22.92 | 0.725 |
 
-Prefill reaches 95-114 tok/s on short prompts.
+Prefill reaches 95-114 tok/s on short prompts and 293 tok/s on a 89K-token prompt, where the cost is amortised over a longer batch.
 
 The L4 provides 300 GB/s of memory bandwidth, so reading 17.9 GB of weights once per token bounds plain autoregressive decode at approximately 16.8 tok/s. Throughput above that bound comes from speculative decoding. A measurement materially below 23 tok/s indicates that ECC is still enabled or that some layers are not resident on the GPU.
 
@@ -165,7 +166,7 @@ Table 6 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggin
 | `Q8_0` | 29.05 GB | exceeds capacity |
 
 ```bash
-HF_FILE=Qwen3.8-27B-UD-Q5_K_XL.gguf CTX=32768 bash scripts/provision-ondemand.sh
+HF_FILE=Qwen3.8-27B-UD-Q5_K_XL.gguf CTX=65536 bash scripts/provision-ondemand.sh
 ```
 
 ## Reproducing the benchmark
