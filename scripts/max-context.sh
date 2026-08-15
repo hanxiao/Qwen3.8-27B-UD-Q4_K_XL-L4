@@ -15,7 +15,7 @@
 set -u
 LO="${LO:-65536}"
 HI="${HI:-262144}"
-TOL="${TOL:-4096}"
+TOL="${TOL:-256}"
 SPEC="${SPEC:---spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.4}"
 
 try_ctx() {

@@ -22,7 +22,7 @@ MACHINE="${MACHINE:-g2-standard-8}"
 PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
 HF_REPO="${HF_REPO:-unsloth/Qwen3.8-27B-GGUF}"
 HF_FILE="${HF_FILE:-Qwen3.8-27B-UD-Q4_K_XL.gguf}"
-CTX="${CTX:-98304}"
+CTX="${CTX:-104192}"
 DL_PARTS="${DL_PARTS:-8}"
 
 [ -n "$PROJECT" ] || { echo "No GCP project set. Use: gcloud config set project <id>"; exit 1; }
