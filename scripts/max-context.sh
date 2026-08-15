@@ -11,7 +11,7 @@
 #   gcloud compute ssh <inst> --zone=<zone> --command 'bash ~/max-context.sh'
 #
 # Env: LO (known-good, default 65536), HI (known-bad upper bound, default 262144),
-#      TOL (stop when HI-LO <= TOL, default 4096), SPEC (extra server args)
+#      TOL (stop when HI-LO <= TOL, default 256), SPEC (extra server args)
 set -u
 LO="${LO:-65536}"
 HI="${HI:-262144}"

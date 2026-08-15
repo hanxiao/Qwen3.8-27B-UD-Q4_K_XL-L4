@@ -9,7 +9,7 @@
 #    exit 127 before it ever starts. Ranged curl needs nothing but curl and is faster
 #    (~100 s for 17.9 GB) than a single-stream hf download anyway.
 #  - The ECC-off reboot is load-bearing. It frees ~1 GB of VRAM. Without it the
-#    17.9 GB of weights plus a 65536-token KV cache do not fit in 24 GB.
+#    17.9 GB of weights plus a 104192-token KV cache do not fit in 24 GB.
 #  - Zones are enumerated live. On-demand L4 capacity is scarce; expect a long walk
 #    through STOCKOUT zones before one lands. That is the script working, not failing.
 #

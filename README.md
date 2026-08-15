@@ -218,3 +218,7 @@ gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -50 /var/l
 ## Related
 
 [hanxiao/Qwen3.6-35B-A3B-MTP-L4](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) serves a sparse MoE on the same card at 92-100 tok/s.
+
+## License
+
+The scripts in this repository are Apache-2.0. The model weights are covered by their own licence: [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the [Unsloth GGUF conversion](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) are both Apache-2.0.
