@@ -1,6 +1,6 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 23 tok/s decode with a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding.
+Qwen3.8-27B serves at 23 tok/s decode with a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. The card holds up to 102,400 tokens of context at this quantization.
 
 ```bash
 gcloud config set project <your-project>
@@ -26,7 +26,9 @@ A sparse MoE of similar size remains faster. [Qwen3.6-35B-A3B with MTP on the sa
 --jinja --tools all --metrics
 ```
 
-llama.cpp divides `--ctx-size` across slots, so `--parallel 1` gives a single slot the full 65,536 tokens instead of splitting them. The two speculative parameters are measured optima, reported in the tuning section below.
+llama.cpp divides `--ctx-size` across slots, so `--parallel 1` gives a single slot the full context instead of splitting it. The two speculative parameters are measured optima, reported in the tuning section below.
+
+The default of 65,536 leaves 3 GB of VRAM free. Raise it with `CTX=102400 bash scripts/provision-ondemand.sh` to use the full capacity measured below.
 
 ECC must be disabled. Turning it off with `nvidia-smi -e 0` and rebooting returns about 1 GB of VRAM, and this configuration does not fit without it. The provisioning script performs this on first boot.
 
@@ -42,23 +44,28 @@ curl -s http://<IP>:8080/v1/chat/completions -H 'Content-Type: application/json'
 
 The instance also serves a web UI on port 8080, Prometheus metrics at `/metrics`, and live slot configuration at `/props`.
 
-## Memory
+## Memory and context capacity
 
-Measured with the server loaded and idle at `--ctx-size 65536`:
+Table 1 reports VRAM measured with the server loaded and idle. Weights account for 17.9 GB at every setting; the difference is the f16 KV cache for the 16 full-attention layers, the MTP draft context and compute buffers.
 
-| Component | Size |
-| --- | --- |
-| Weights | 17.9 GB |
-| Total in use | 21,506 MiB |
-| Device total | 24,570 MiB |
+**Table 1: VRAM against context size, on a 24,570 MiB device.**
 
-The remaining 3.6 GB holds the f16 KV cache for the 16 full-attention layers, the MTP draft context and compute buffers. Headroom is left at this setting, so 65,536 is a working default and not the ceiling.
+| `--ctx-size` | VRAM used | Free |
+| --- | --- | --- |
+| 65,536 (default) | 21,500 MiB | 3,070 MiB |
+| 90,112 | 23,138 MiB | 1,432 MiB |
+| **102,400 (maximum)** | **23,956 MiB** | **614 MiB** |
+| 105,472 | fails to serve | |
+
+`scripts/max-context.sh` locates this limit by binary search. A context counts as working only when the server both reaches `/health` and completes a generation, because llama.cpp allocates the KV cache at load time while some compute buffers are sized on the first decode. A context that loads can still fail under traffic.
+
+The limit was confirmed under load rather than at idle. An 89,125-token prompt at `--ctx-size 102400` returned a correct answer, held decode at 25.4 tok/s with prefill at 293 tok/s, and peaked at 23,962 MiB.
 
 ## Performance
 
-Table 1 reports decode throughput from `scripts/bench.sh`, run on the instance under the shipped configuration. The metric is `timings.predicted_per_second`, which excludes prompt processing, measured with `cache_prompt` disabled, greedy sampling, 256 max tokens, averaged over two runs per workload.
+Table 2 reports decode throughput from `scripts/bench.sh`, run on the instance under the shipped configuration. The metric is `timings.predicted_per_second`, which excludes prompt processing, measured with `cache_prompt` disabled, greedy sampling, 256 max tokens, averaged over two runs per workload.
 
-**Table 1: Decode throughput and MTP acceptance by workload.**
+**Table 2: Decode throughput and MTP acceptance by workload.**
 
 | Workload | Decode (tok/s) | MTP acceptance |
 | --- | --- | --- |
@@ -78,9 +85,9 @@ The L4 provides 300 GB/s of memory bandwidth, so reading 17.9 GB of weights once
 
 `scripts/sweep-spec.sh` reproduces this section. The sweep covers draft-side and scheduling parameters, which change how tokens are proposed but not which tokens are ultimately emitted. Target-side KV quantization is excluded because it trades quality for memory, and the objective here is speed at fixed quality.
 
-Table 2 reports the one parameter that improved throughput. `--spec-draft-p-min` suppresses drafting when the draft head is not confident, which avoids issuing a forward pass whose result would be rejected.
+Table 3 reports the one parameter that improved throughput. `--spec-draft-p-min` suppresses drafting when the draft head is not confident, which avoids issuing a forward pass whose result would be rejected.
 
-**Table 2: Effect of the draft confidence threshold. Average is over five workloads.**
+**Table 3: Effect of the draft confidence threshold. Average is over five workloads.**
 
 | p-min | Average (tok/s) | Code (tok/s) | Code acceptance |
 | --- | --- | --- | --- |
@@ -95,11 +102,11 @@ Table 2 reports the one parameter that improved throughput. `--spec-draft-p-min`
 
 The gain concentrates on the workload that was previously slowest: code rises from 20.66 to 23.90 tok/s, and the spread across workloads narrows from 22.7-26.2 to 22.9-24.6.
 
-Acceptance is a diagnostic and not an objective. A threshold of 0.80 produces the highest acceptance in Table 2 and nearly the lowest throughput, because it suppresses productive drafts along with unproductive ones.
+Acceptance is a diagnostic and not an objective. A threshold of 0.80 produces the highest acceptance in Table 3 and nearly the lowest throughput, because it suppresses productive drafts along with unproductive ones.
 
-Table 3 records the remaining parameters at their measured settings, so they need not be swept again.
+Table 4 records the remaining parameters at their measured settings, so they need not be swept again.
 
-**Table 3: Parameters that leave throughput unchanged or reduce it.**
+**Table 4: Parameters that leave throughput unchanged or reduce it.**
 
 | Parameter | Setting | Average (tok/s) | Note |
 | --- | --- | --- | --- |
@@ -127,9 +134,9 @@ Two upstream leads do not apply here. `GGML_CUDA_MMVQ_MAX` from llama.cpp [PR#26
 
 Byte-level output is not identical to `--spec-type none`. Two controls locate the cause. Running one configuration twice is byte-identical on all five tasks, so the server is deterministic. Plain MTP without p-min already diverges from no-speculation, so the flag is not responsible. Accepting a drafted token changes the batch shape of the forward pass and therefore the order of floating-point reduction, which flips tokens that were near ties. This property is intrinsic to speculative decoding.
 
-Correctness is the operative test. Table 4 reports accuracy on 40 arithmetic problems with known ground truth.
+Correctness is the operative test. Table 5 reports accuracy on 40 arithmetic problems with known ground truth.
 
-**Table 4: Verifiable accuracy across configurations.**
+**Table 5: Verifiable accuracy across configurations.**
 
 | Configuration | Accuracy |
 | --- | --- |
@@ -141,9 +148,9 @@ Run `--spec-type none` at roughly 16-17 tok/s when bit-exact reproducibility mat
 
 ## Quantizations
 
-Table 5 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` at 65,536 context is measured here; the fit column compares file size against device capacity.
+Table 6 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
 
-**Table 5: Quantizations and fit on a 24 GB L4.**
+**Table 6: Quantizations and fit on a 24 GB L4.**
 
 | File | Size | Fit |
 | --- | --- | --- |
@@ -152,7 +159,7 @@ Table 5 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggin
 | `UD-Q3_K_XL` | 13.44 GB | fits |
 | `Q4_K_M` | 17.11 GB | fits |
 | **`UD-Q4_K_XL`** | **17.92 GB** | **default here** |
-| `UD-Q5_K_XL` | 20.22 GB | fits with reduced context |
+| `UD-Q5_K_XL` | 20.22 GB | fits, with roughly 2.3 GB less for KV |
 | `Q6_K` | 22.88 GB | no room for KV cache |
 | `UD-Q6_K_XL` | 25.92 GB | exceeds capacity |
 | `Q8_0` | 29.05 GB | exceeds capacity |
@@ -201,6 +208,7 @@ gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -50 /var/l
 | `scripts/provision-ondemand.sh` | create the L4, fetch the model, start the server, wait for health |
 | `scripts/bench.sh` | seven-workload decode benchmark |
 | `scripts/sweep-spec.sh` | speculative decoding parameter sweep |
+| `scripts/max-context.sh` | binary search for the largest usable context |
 | `scripts/verify-quality.sh` | determinism and accuracy checks |
 | `scripts/teardown.sh` | stop or delete |
 
