@@ -97,7 +97,7 @@ docker run -d --name llama-server --restart unless-stopped --gpus all -p 8080:80
   --model /models/model.gguf \
   --alias Qwen3.8-27B-UD-Q4KXL-MTP --host 0.0.0.0 --port 8080 --jinja --tools all \
   --ctx-size $CTX --parallel 1 --flash-attn on -ngl 99 -ub 64 -b 512 \
-  --no-mmap --threads 8 --spec-type draft-mtp --spec-draft-n-max 2 --no-warmup --metrics
+  --no-mmap --threads 8 --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.4 --no-warmup --metrics
 echo "[startup] done \$(date -u +%H:%M:%S)"
 SH
 
