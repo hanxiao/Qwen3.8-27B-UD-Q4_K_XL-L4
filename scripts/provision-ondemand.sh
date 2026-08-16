@@ -101,10 +101,22 @@ docker run -d --name llama-server --restart unless-stopped --gpus all -p 8080:80
 echo "[startup] done \$(date -u +%H:%M:%S)"
 SH
 
-say "Ensuring firewall for :8080 ..."
-gcloud compute firewall-rules create allow-llama-8080 \
-  --allow=tcp:8080 --target-tags=llama-server --source-ranges=0.0.0.0/0 \
-  --project="$PROJECT" 2>/dev/null || true
+# INTERNAL=1 (default) restricts :8080 to RFC1918. INTERNAL=0 opens it to the internet,
+# which is only appropriate for a throwaway benchmark: the server has no authentication.
+INTERNAL="${INTERNAL:-1}"
+if [ "$INTERNAL" = "1" ]; then
+  NET_TAG=llama-internal
+  say "Ensuring VPC-only firewall for :8080 ..."
+  gcloud compute firewall-rules create allow-llama-internal-8080 \
+    --allow=tcp:8080 --target-tags=llama-internal --source-ranges=10.128.0.0/9 \
+    --project="$PROJECT" 2>/dev/null || true
+else
+  NET_TAG=llama-server
+  say "Ensuring PUBLIC firewall for :8080 ..."
+  gcloud compute firewall-rules create allow-llama-8080 \
+    --allow=tcp:8080 --target-tags=llama-server --source-ranges=0.0.0.0/0 \
+    --project="$PROJECT" 2>/dev/null || true
+fi
 
 ZONE=""
 for z in $ZONES; do
@@ -116,7 +128,7 @@ for z in $ZONES; do
       --image-family=common-cu129-ubuntu-2204-nvidia-580 \
       --image-project=deeplearning-platform-release \
       --boot-disk-size=80GB --boot-disk-type=pd-ssd \
-      --tags=llama-server \
+      --tags="$NET_TAG" \
       --metadata-from-file=startup-script="$STARTUP" 2>&1 | tail -3; then
     ZONE="$z"; break
   fi
@@ -128,16 +140,27 @@ rm -f "$STARTUP"
 # The instance is recreated as zones are retried, so always re-read the IP here.
 IP="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
         --format='value(networkInterfaces[0].accessConfigs[0].natIP)')"
+INTERNAL_IP="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+        --format='value(networkInterfaces[0].networkIP)')"
 echo "ZONE=$ZONE"
 echo "IP=$IP"
 say "Created in $ZONE (IP $IP). Waiting for /health (ECC reboot + 17.9 GB pull + load) ..."
+# With INTERNAL=1 the port is unreachable from here, so health is probed over IAP SSH.
+probe() {
+  if [ "$INTERNAL" = "1" ]; then
+    gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT" --tunnel-through-iap \
+      --command 'curl -fsS --max-time 5 http://127.0.0.1:8080/health' 2>/dev/null
+  else
+    curl -fsS --max-time 5 "http://$IP:8080/health" 2>/dev/null
+  fi
+}
 for i in $(seq 1 180); do
-  if curl -fsS --max-time 5 "http://$IP:8080/health" 2>/dev/null | grep -q '"status":"ok"'; then
+  if probe | grep -q '"status":"ok"'; then
     say "READY"
     cat <<EOF
-  Web UI:   http://$IP:8080
-  API:      http://$IP:8080/v1/chat/completions
-  Metrics:  http://$IP:8080/metrics
+  Internal: http://$INTERNAL_IP:8080  (VPC only when INTERNAL=1)
+  API:      http://$INTERNAL_IP:8080/v1/chat/completions
+  Metrics:  http://$INTERNAL_IP:8080/metrics
   Bench:    gcloud compute scp scripts/bench.sh $INSTANCE:~/bench.sh --zone=$ZONE --project=$PROJECT
             gcloud compute ssh $INSTANCE --zone=$ZONE --project=$PROJECT --command 'bash ~/bench.sh 127.0.0.1:8080'
   Stop:     gcloud compute instances stop   $INSTANCE --zone=$ZONE --project=$PROJECT

@@ -42,6 +42,33 @@ curl -s http://<IP>:8080/v1/chat/completions -H 'Content-Type: application/json'
 
 The instance also serves a web UI on port 8080, Prometheus metrics at `/metrics`, and live slot configuration at `/props`.
 
+## Network access
+
+The server binds `0.0.0.0` and has no authentication, so the firewall is the only thing standing between the model and the internet. The provisioning script opens `tcp:8080` to `0.0.0.0/0` through the `llama-server` tag, which is convenient for a throwaway benchmark and wrong for anything that stays up.
+
+To restrict it to the VPC, put the instance on a tag whose rule only admits RFC1918 traffic:
+
+```bash
+gcloud compute firewall-rules create allow-llama-internal-8080 \
+  --network=default --direction=INGRESS --action=ALLOW --rules=tcp:8080 \
+  --target-tags=llama-internal --source-ranges=10.128.0.0/9
+
+gcloud compute instances add-tags    qwen38-27b-l4-od --zone=$ZONE --tags=llama-internal
+gcloud compute instances remove-tags qwen38-27b-l4-od --zone=$ZONE --tags=llama-server
+```
+
+Removing `llama-server` is the part that matters. Firewall rules are additive, so keeping both tags leaves the permissive rule in force and the narrow rule changes nothing.
+
+The external IP stays attached. It carries outbound traffic only, which the startup script needs to reach Hugging Face and the container registry; a VM with no external IP and no Cloud NAT will boot into an empty `/opt/models`. Verify from both sides, because a closed port and a dead server look identical from outside:
+
+```bash
+curl -m 10 http://$EXTERNAL_IP:8080/health                 # expect a timeout
+gcloud compute ssh <another-vm> --command \
+  'curl -s http://<internal-ip>:8080/health'               # expect {"status":"ok"}
+```
+
+Administrative access runs over IAP (`gcloud compute ssh --tunnel-through-iap`), so no inbound port needs to be open for operations.
+
 ## Memory and context capacity
 
 Table 1 reports VRAM measured with the server loaded and idle. Weights account for 17.9 GB at every setting, and the difference is the f16 KV cache for the 16 full-attention layers, the MTP draft context and compute buffers.
@@ -198,6 +225,8 @@ The deep-learning images do not provide `pip` on PATH. A startup script that dow
 
 On-demand L4 capacity is scarce. A typical run walks through nine or more zones returning `STOCKOUT` before one succeeds, so allow roughly 15 minutes to reach READY and let the script cycle. Each retry recreates the instance, so read the external IP from `gcloud compute instances list` once the script reports READY.
 
+A stopped instance restarts with `bash scripts/start.sh`, keeping its disk and the downloaded model, but the zone does not hold capacity for it. Restarts return `STOCKOUT` exactly as creation does, and a stopped instance cannot change zones, so the script retries in place until an L4 frees up. Restarting also re-runs the startup script, which means the serving flags come from instance metadata rather than from the script that first created it; update them together, or a restart will silently revert the context size and the tuned speculative parameters.
+
 When `/health` never comes up, the boot log carries the reason:
 
 ```bash
@@ -213,6 +242,7 @@ gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -50 /var/l
 | `scripts/sweep-spec.sh` | speculative decoding parameter sweep |
 | `scripts/max-context.sh` | binary search for the largest usable context |
 | `scripts/verify-quality.sh` | determinism and accuracy checks |
+| `scripts/start.sh` | restart a stopped instance, retrying through STOCKOUT |
 | `scripts/teardown.sh` | stop or delete |
 
 ## Related
