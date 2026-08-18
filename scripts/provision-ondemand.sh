@@ -17,13 +17,16 @@
 #    through STOCKOUT zones before one lands. That is the script working, not failing.
 #
 # Usage:  bash scripts/provision-ondemand.sh
-# Env:    INSTANCE, MACHINE, PROJECT, ZONES, CTX, NMAX, MMVQ_MAX, INTERNAL
+# Env:    INSTANCE, MACHINE, PROJECT, ZONES, FIT_TARGET, KV, NMAX, MMVQ_MAX, INTERNAL
 set -euo pipefail
 
 INSTANCE="${INSTANCE:-qwen38-27b-l4-od}"
 MACHINE="${MACHINE:-g2-standard-8}"
 PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
-CTX="${CTX:-65536}"
+# The context size is planned on the instance by llama.cpp --fit; what is set here is
+# the margin it must leave free and the KV cache type, which together decide the window.
+FIT_TARGET="${FIT_TARGET:-768}"
+KV="${KV:-q4_0}"
 NMAX="${NMAX:-5}"
 MMVQ_MAX="${MMVQ_MAX:-2}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -67,7 +70,7 @@ for z in $ZONES; do
       --image-project=deeplearning-platform-release \
       --boot-disk-size=120GB --boot-disk-type=pd-ssd \
       --tags="$NET_TAG" \
-      --metadata="qwen-ctx=$CTX,qwen-nmax=$NMAX,qwen-mmvq-max=$MMVQ_MAX" \
+      --metadata="qwen-fit-target=$FIT_TARGET,qwen-kv=$KV,qwen-nmax=$NMAX,qwen-mmvq-max=$MMVQ_MAX" \
       --metadata-from-file="$META" 2>&1 | tail -3; then
     ZONE="$z"; break
   fi

@@ -601,7 +601,7 @@ The provisioning script takes the target file through instance metadata:
 
 ```bash
 gcloud compute instances add-metadata qwen38-27b-l4-od --zone=$ZONE \
-  --metadata=qwen-hf-file=Qwen3.8-27B-UD-Q5_K_XL.gguf,qwen-ctx=49152
+  --metadata=qwen-hf-file=Qwen3.8-27B-UD-Q5_K_XL.gguf,qwen-fit-target=1024
 ```
 
 The draft head is tied to the model family, not to the quantization of the target, so it does not change with the target file.
@@ -628,7 +628,7 @@ The server runs under systemd as `qwen-server`, not under docker, because the pa
 
 On-demand L4 capacity is scarce. A typical run walks through nine or more zones returning `STOCKOUT` before one succeeds, so let the script cycle. Each retry recreates the instance, so read the external IP from `gcloud compute instances list` once the script reports READY.
 
-A stopped instance restarts with `bash scripts/start.sh`, keeping its disk, the models and the build, but the zone does not hold capacity for it. Restarts return `STOCKOUT` exactly as creation does, and a stopped instance cannot change zones, so the script retries in place until an L4 frees up. Serving flags come from instance metadata, so a restart picks up whatever the metadata currently says. `startup.sh` reads `qwen-ctx`, `qwen-nmax`, `qwen-mmvq-max`, `qwen-chain-sub` and `qwen-lcpp-pr` for serving and build behaviour, and `qwen-hf-repo` / `qwen-hf-file` / `qwen-draft-repo` / `qwen-draft-file` to choose the model and draft head; all have defaults, and `provision-ondemand.sh` sets only the first three.
+A stopped instance restarts with `bash scripts/start.sh`, keeping its disk, the models and the build, but the zone does not hold capacity for it. Restarts return `STOCKOUT` exactly as creation does, and a stopped instance cannot change zones, so the script retries in place until an L4 frees up. Serving flags come from instance metadata, so a restart picks up whatever the metadata currently says. `startup.sh` reads `qwen-fit-target`, `qwen-kv`, `qwen-nmax`, `qwen-mmvq-max`, `qwen-chain-sub` and `qwen-lcpp-pr` for serving and build behaviour, and `qwen-hf-repo` / `qwen-hf-file` / `qwen-draft-repo` / `qwen-draft-file` to choose the model and draft head; all have defaults, and `provision-ondemand.sh` sets only the first three.
 
 When `/health` never comes up, the boot log carries the reason:
 

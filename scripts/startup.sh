@@ -8,7 +8,11 @@ echo "[startup] boot $(date -u +%H:%M:%S)"
 md() { curl -s -H 'Metadata-Flavor: Google' \
   "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" 2>/dev/null; }
 
-CTX="$(md qwen-ctx)";        CTX="${CTX:-65536}"
+# The context is planned by llama.cpp, not set here: --fit sizes it to the device with
+# --fit-target MiB left free, which is what keeps the compute graph buffers allocated at
+# decode time from exhausting the card.
+FIT_TARGET="$(md qwen-fit-target)"; FIT_TARGET="${FIT_TARGET:-768}"
+KV="$(md qwen-kv)";          KV="${KV:-q4_0}"
 NMAX="$(md qwen-nmax)";      NMAX="${NMAX:-5}"
 HF_REPO="$(md qwen-hf-repo)"; HF_REPO="${HF_REPO:-unsloth/Qwen3.8-27B-GGUF}"
 HF_FILE="$(md qwen-hf-file)"; HF_FILE="${HF_FILE:-Qwen3.8-27B-UD-Q4_K_XL.gguf}"
@@ -102,7 +106,8 @@ Environment=LD_LIBRARY_PATH=/opt/llama.cpp/build/bin:/usr/local/cuda-12.9/lib64
 ExecStart=/opt/llama.cpp/build/bin/llama-server \\
   --model $MODEL --alias Qwen3.8-27B-UD-Q4KXL-MTP \\
   --host 0.0.0.0 --port 8080 --jinja --tools all --metrics \\
-  --ctx-size $CTX --parallel 1 --flash-attn on -ngl 99 -ub 512 -b 512 \\
+  --parallel 1 --flash-attn on --fit on --fit-target $FIT_TARGET \\
+  -ub 512 -b 2048 --cache-type-k $KV --cache-type-v $KV \\
   --no-mmap --threads 8 -bs \\
   --spec-type draft-mtp --spec-draft-model $DRAFT --spec-draft-ngl 99 \\
   --spec-draft-n-max $NMAX --spec-draft-n-min $NMAX --spec-draft-p-min 0.0
