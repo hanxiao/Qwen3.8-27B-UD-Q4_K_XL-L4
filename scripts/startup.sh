@@ -5,11 +5,12 @@ set -e
 exec >>/var/log/qwen-startup.log 2>&1
 echo "[startup] boot $(date -u +%H:%M:%S)"
 
-# -f matters: without it curl prints the metadata server's 404 HTML page on an unset key, and
-# a non-empty value defeats every ${VAR:-default} below. That fails late and confusingly - the
-# model URL becomes an error page, the download writes a 0-byte file, and the build never runs.
+# -f matters twice over. Without it curl prints the metadata server's 404 HTML page for an
+# unset key, and a non-empty value defeats every ${VAR:-default} below. With it curl exits 22
+# on that 404, which under `set -e` aborts the script at the first key the caller did not set,
+# so the failure has to be swallowed here rather than propagated.
 md() { curl -sf -H 'Metadata-Flavor: Google' \
-  "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" 2>/dev/null; }
+  "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" 2>/dev/null || true; }
 
 # The context is planned by llama.cpp, not set here: --fit sizes it to the device with
 # --fit-target MiB left free, which is what keeps the compute graph buffers allocated at
