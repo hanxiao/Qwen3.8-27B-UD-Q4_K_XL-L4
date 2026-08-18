@@ -220,6 +220,25 @@ The previous column is this repository's earlier measurement; re-measuring that 
 
 Structured reasoning speculates best and open-ended chat worst, which is the usual shape: the gain tracks how predictable the next token is, and `math` reaches 3.53 accepted tokens per pass against `chat` at 2.70.
 
+Generation length changes the answer, and in a way worth stating explicitly because it is the difference between this benchmark and most published figures. Acceptance is worst in the first tokens after a prompt and climbs as the model settles into an answer, so a 256-token cap measures the least favourable part of every generation. Raising only the cap, changing nothing else:
+
+**Table 4c: the same configuration at a higher token cap.**
+
+| Workload | 256 max tokens | 1024 max tokens | Acceptance at 1024 |
+| --- | --- | --- | --- |
+| summarization | 34.22 | **46.51** | 0.672 |
+| math | 37.16 | 39.54 | 0.536 |
+| prose | 30.58 | 34.28 | 0.438 |
+| code | 31.95 | 33.10 | 0.416 |
+| json | 31.09 | 31.57 | 0.388 |
+| chat | 29.15 | 27.91 | 0.321 |
+| multi-turn | 32.87 | 26.30 | 0.290 |
+| **average** | **32.43** | **34.17** | |
+
+The average moves 5.4%, but the spread roughly doubles, and two workloads get *worse*: `chat` and `multi-turn` run past their natural answer into open-ended continuation, which speculates badly, while `summarization` stays inside the source text and reaches 0.672 acceptance and 46.51 tok/s. Three workloads (`prose`, `math`, and `summarization` at 2048) stop on their own before the cap, so their rows compare a truncated answer against a complete one rather than two lengths of the same text.
+
+The headline number in Table 4 stays the 256-token one. It is the harder measurement and the one this repository has always reported, and moving to a friendlier cap to claim a larger number would make the figure incomparable with its own history. It is worth knowing that sustained generation on this configuration runs nearer 34, and that a summarization-shaped workload runs nearer 46.
+
 Throughput is flat against context. At 32,768 / 65,536 / 81,920 the same configuration measures 29.63 / 29.51 / 29.60 tok/s on a two-workload subset, and the full benchmark gives 30.97 at 65,536 against 30.98 at 81,920. Context is a memory question, not a speed one, which is why the shipped default is the one that leaves headroom rather than the one that fits.
 
 ## What the same model does on other 24 GB cards
