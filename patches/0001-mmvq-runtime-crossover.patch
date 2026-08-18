@@ -1,8 +1,8 @@
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index cd2dfc7..89e616b 100644
+index 32f3a23..5d0fd2a 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2783,7 +2783,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3038,7 +3038,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
              str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
          }
  
@@ -12,7 +12,7 @@ index cd2dfc7..89e616b 100644
                  impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                  impl->n_gen_drafts,
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 0589e65..b6d8d53 100644
+index 0589e65..601fd2e 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -21,17 +21,40 @@ index 0589e65..b6d8d53 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -280,6 +281,15 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+@@ -280,6 +281,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
  }
  
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
 +    // GGML_MMVQ_MAX: override the MMVQ batch ceiling at runtime (default MMVQ_MAX_BATCH_SIZE).
 +    // Setting it below 8 pushes those batch widths onto MMQ (int8 tensor cores) instead.
-+    static const int64_t mmvq_max_env = []() -> int64_t {
-+        const char * s = getenv("GGML_MMVQ_MAX");
-+        return s ? atoll(s) : (int64_t) MMVQ_MAX_BATCH_SIZE;
-+    }();
-+    if (ne11 > mmvq_max_env) {
++    // Per-quant-type crossover. The file is a mix of types and the MMQ admission cost is not
++    // necessarily uniform across them, so allow each to be routed independently:
++    //   GGML_MMVQ_MAX        global default
++    //   GGML_MMVQ_MAX_Q5K / _Q4K / _Q6K / _IQ4XS   per-type override
++    struct mmvq_thresholds {
++        int64_t def, q5k, q4k, q6k, iq4xs;
++        static int64_t get(const char * name, int64_t fallback) {
++            const char * s = getenv(name);
++            return s ? atoll(s) : fallback;
++        }
++        mmvq_thresholds() {
++            def   = get("GGML_MMVQ_MAX", (int64_t) MMVQ_MAX_BATCH_SIZE);
++            q5k   = get("GGML_MMVQ_MAX_Q5K",   def);
++            q4k   = get("GGML_MMVQ_MAX_Q4K",   def);
++            q6k   = get("GGML_MMVQ_MAX_Q6K",   def);
++            iq4xs = get("GGML_MMVQ_MAX_IQ4XS", def);
++        }
++    };
++    static const mmvq_thresholds th;
++    int64_t lim = th.def;
++    switch (type) {
++        case GGML_TYPE_Q5_K:   lim = th.q5k;   break;
++        case GGML_TYPE_Q4_K:   lim = th.q4k;   break;
++        case GGML_TYPE_Q6_K:   lim = th.q6k;   break;
++        case GGML_TYPE_IQ4_XS: lim = th.iq4xs; break;
++        default: break;
++    }
++    if (ne11 > lim) {
 +        return false;
 +    }
      if (!ggml_is_quantized(type)) {

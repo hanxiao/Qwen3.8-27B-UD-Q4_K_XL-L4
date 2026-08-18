@@ -1,6 +1,6 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 32.4 tok/s decode over a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.34x the 24.1 tok/s this repository previously served, at identical quantization and with no measured quality regression.
+Qwen3.8-27B serves at 32.9 tok/s decode over a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.36x the 24.1 tok/s this repository previously served, at identical quantization and with no measured quality regression.
 
 ```bash
 gcloud config set project <your-project>
@@ -20,7 +20,8 @@ Three things moved throughput, in descending order of size. None of them changes
 | Draft from a separate, cheaper MTP head | 30.39 | +8.3% |
 | Retype that head's output tensor to Q2_K, n-max 5 | 30.7 | +1.1% |
 | Sample on the GPU (`-bs`) instead of copying 248,320 logits per verified position to the host | 31.0 | +0.9% |
-| Draft the whole chain in one decode, with a 98,304-wide draft sub-head | **32.4** | +4.7% |
+| Draft the whole chain in one decode, with a 98,304-wide draft sub-head | 32.4 | +4.7% |
+| Route Q6_K and IQ4_XS back to MMVQ, per quant type | **32.9** | +1.4% |
 
 The first change is the interesting one, and it is a one-line patch to llama.cpp. The rest of this README explains why, because the reasoning generalizes to any speculative decoding setup on a compute-poor card.
 
@@ -77,6 +78,22 @@ MMQ is behind at width 1 and 2 and ahead from width 3, which is exactly where `G
 
 This is now the largest single removable cost in the cycle, and nothing in llama.cpp removes it. Closing it needs a mixed-precision GEMM that keeps streaming efficiency at M=6, which is what Marlin and Machete do for W4A16 in other stacks and what llama.cpp does not have for K-quants.
 
+The fee is not uniform across quant types, which is worth a little. `GGML_MMVQ_MAX` in the patch takes per-type overrides, and sweeping each of this file's four types independently at draft depth 5 gives:
+
+**Table 2b: routing one quant type back to MMVQ, everything else on MMQ.**
+
+| Routed to MMVQ | Share of weights | Decode (tok/s) |
+| --- | --- | --- |
+| nothing, all MMQ | | 31.04 |
+| Q4_K | 4% | 31.05 |
+| **IQ4_XS** | **17%** | **31.76** |
+| **Q6_K** | **6%** | **31.83** |
+| Q5_K | 72% | 20.51 |
+
+Q5_K must stay on MMQ: it is 72% of the weights and MMVQ's per-column cost lands on all of it, costing a third of throughput. Q6_K and IQ4_XS are small enough that MMVQ's cheaper entry beats its worse slope. Shipping both gives 32.88 against 32.41, measured over the full benchmark.
+
+Two other tuning surfaces turned out not to be surfaces at all. The MMQ tile table (`mmq-config-ampere.cuh`, which Volta, Turing, Ampere and Ada all share) is not free-form: dropping `I` from 128 to 64 for the J=8 rows builds and then dies with an illegal memory access, because the tile geometry is tied to the MMA fragment layout, and raising `occupancy` from 1 to 2 is inert at 31.14 against 31.21. And `ik_llama.cpp`, the obvious fork to try for better quantized matmuls, has no `draft-mtp` and no fused Gated DeltaNet op, so it cannot run this configuration at all regardless of how fast its kernels are.
+
 This is not reachable by configuration. `GGML_CUDA_FORCE_MMQ` is a compile-time flag evaluated inside `ggml_cuda_should_use_mmq`, which the dispatcher never calls once `ggml_cuda_should_use_mmvq` has returned true. `patches/0001-mmvq-runtime-crossover.patch` adds a `GGML_MMVQ_MAX` environment variable to that one predicate. Setting it to 2 keeps MMVQ for plain batch-1 decode, where MMVQ is genuinely faster, and routes everything wider to MMQ.
 
 ## Why the draft head was replaced
@@ -132,7 +149,7 @@ Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2,
 -bs --jinja --tools all --metrics
 ```
 
-with `GGML_MMVQ_MAX=2 LLAMA_SPEC_CHAIN=1 LLAMA_SPEC_CHAIN_SUB=98304 LLAMA_SCHED_POOL=8` in the environment.
+with `GGML_MMVQ_MAX=2 GGML_MMVQ_MAX_Q6K=8 GGML_MMVQ_MAX_IQ4XS=8 LLAMA_SPEC_CHAIN=1 LLAMA_SPEC_CHAIN_SUB=98304 LLAMA_SCHED_POOL=8` in the environment.
 
 `--spec-draft-p-min 0.0` reverses the previous configuration, which used 0.4. The confidence gate exists to suppress drafts that are likely to be rejected, and it was worth 4% when a draft step cost 5.3 ms and a rejected draft made verification 26 ms more expensive. At 2.73 ms per draft step and 2.3 ms per unit of verification width, a rejected draft is cheap enough that suppressing it costs more than it saves. Measured at n-max 3 with the cheap head: p-min 0.0 gives 28.71 tok/s, 0.3 gives 27.11, 0.5 gives 26.17, 0.6 gives 25.13.
 
@@ -177,9 +194,9 @@ Table 4 reports decode throughput from `scripts/bench.sh`. The metric is `timing
 | code | 23.67 | **31.20** | 1.32x | 2.79 |
 | prose | 22.96 | **30.69** | 1.34x | 2.75 |
 | chat | 23.24 | **29.52** | 1.27x | 2.64 |
-| **average** | **24.18** | **32.41** | **1.34x** | **3.01** |
+| **average** | **24.18** | **32.88** | **1.36x** | **3.04** |
 
-The previous column is this repository's earlier measurement; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. Two full passes of the shipped configuration gave 32.42 and 32.41. Earlier configurations, for reference: 30.80/30.71/30.68 without `-bs`, and 30.98/30.97 with it.
+The previous column is this repository's earlier measurement; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. The tuned column is the global-crossover configuration measured per workload; the shipped per-type configuration measures 32.88 on the same seven-workload pass, 1.4% above it. Repeat passes: 32.42, 32.41, 32.49 global, 32.88 per-type.
 
 Structured reasoning speculates best and open-ended chat worst, which is the usual shape: the gain tracks how predictable the next token is, and `math` reaches 3.53 accepted tokens per pass against `chat` at 2.70.
 
@@ -206,9 +223,9 @@ Mean accepted length is therefore the entire problem, and Table 5 says where it 
 
 The MTP head saturates at 3.21 because its per-position acceptance decays: 0.78, 0.55, 0.35, 0.25, 0.18, 0.10, 0.07. Drafting deeper adds cost and almost no accepted tokens. Nothing published for Qwen3.8-27B reaches 6.7. The gap is a factor of 1.6 against the best figure reported for this model on any quantization, and 2.1 against the best reported on this one.
 
-Two idealized bounds make the headroom concrete. Give drafting away for free and keep the measured verification cost: 3.21 / 100.1 ms is 32.1 tok/s. Give away drafting *and* all verification width, so every pass costs the bare 66.9 ms weight read: 3.21 / 66.9 ms is 48.0 tok/s. The configuration here reaches 32.4, which is essentially at the first bound. The remaining distance to 100 tok/s is not implementation slack. It is the drafter.
+Two idealized bounds make the headroom concrete. Give drafting away for free and keep the measured verification cost: 3.21 / 100.1 ms is 32.1 tok/s. Give away drafting *and* all verification width, so every pass costs the bare 66.9 ms weight read: 3.21 / 66.9 ms is 48.0 tok/s. The configuration here reaches 32.9, which is past the first bound. The remaining distance to 100 tok/s is not implementation slack. It is the drafter.
 
-The same arithmetic answers a nearer question, 40 tok/s, which is worth writing down because it is close enough to argue about. At the shipped accepted length of 3.01, 40 tok/s means a 75.2 ms cycle. The current cycle is 92.8 ms: 66.9 ms of weight read, 9.7 ms of MMQ admission cost, 7.9 ms of verification width, and 8.3 ms of drafting. Removing the MMQ penalty alone gives 36.2. Removing it and halving drafting gives 38.3. Reaching 40 requires essentially all of the kernel overhead to go, or accepted length to rise from 3.01 to about 3.7. Both are real projects: the first is a Marlin-class kernel for K-quants at M=6, the second is a trained draft head. Neither is a flag.
+The same arithmetic answers a nearer question, 40 tok/s, which is worth writing down because it is close enough to argue about. At the shipped accepted length of 3.01, 40 tok/s means a 75.2 ms cycle. The current cycle is 92.4 ms: 66.9 ms of weight read, about 9 ms of MMQ admission cost, 7.9 ms of verification width, and 8.3 ms of drafting. Removing the MMQ penalty alone gives 36.2. Removing it and halving drafting gives 38.3. Reaching 40 requires essentially all of the kernel overhead to go, or accepted length to rise from 3.01 to about 3.7. Both are real projects: the first is a Marlin-class kernel for K-quants at M=6, the second is a trained draft head. Neither is a flag.
 
 What would close it is a draft head with mean accepted length near 7, which means a trained head rather than a better-tuned one. The published recipes that reach 5.3 to 5.5 on comparable targets regenerate 12,000 to 40,000 answers from the served quantized target, capture hidden states from the GGUF itself, warm-start from an existing head of the same geometry, and train for 6 to 10 hours on a 96 GB card. That is the identified next step, and it is a training project, not a serving one. A second, cheaper lever is tree drafting: verification width is now nearly free up to 16 tokens, so spending that width on several candidate branches instead of one chain should raise accepted length by roughly a third. llama.cpp has no tree support in any speculative implementation, and adding it needs per-token attention masks that the current API does not expose.
 
@@ -259,7 +276,7 @@ CUDA error: out of memory
 
 The seven-workload benchmark never triggers it because it replays the same seven shapes, so the number looks fine right up until real traffic arrives. It surfaced only when the 40-prompt accuracy check ran, with `enable_thinking` off and 40 distinct short prompts, and took the server down twice. The fix is headroom, not a smaller graph: 65,536 leaves 1.7 GiB, survives the same stress with zero restarts, and costs nothing measurable in throughput. Treat "fits at idle" as necessary and not sufficient, and validate a context ceiling with varied prompt shapes rather than with the benchmark.
 
-The trade is therefore 65,536 tokens at 32.4 tok/s against 104,192 tokens at 24.1. Sixteen of the 64 layers keep a KV cache, at 64 KiB per token, and the draft context adds 4 KiB per token, so context costs 68 KiB per token against 64 KiB before.
+The trade is therefore 65,536 tokens at 32.9 tok/s against 104,192 tokens at 24.1. Sixteen of the 64 layers keep a KV cache, at 64 KiB per token, and the draft context adds 4 KiB per token, so context costs 68 KiB per token against 64 KiB before.
 
 If the full 104,192 matters more than the last 9%, drop `--spec-draft-model` and keep the kernel patch. That configuration measures 28.05 tok/s, needs no second model, and fits the original context: it is `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 3 --spec-draft-p-min 0.0` with `GGML_MMVQ_MAX=2`.
 
@@ -360,7 +377,7 @@ The draft head is tied to the model family, not to the target's quantization, so
 
 ## Cost
 
-An on-demand `g2-standard-8` costs approximately $0.81/hr and bills while the instance is RUNNING, independent of load. At 32.4 tok/s that is 144,000 tokens per dollar, against 107,000 before.
+An on-demand `g2-standard-8` costs approximately $0.81/hr and bills while the instance is RUNNING, independent of load. At 32.9 tok/s that is 146,000 tokens per dollar, against 107,000 before.
 
 ```bash
 bash scripts/teardown.sh          # stop, preserving disk and models

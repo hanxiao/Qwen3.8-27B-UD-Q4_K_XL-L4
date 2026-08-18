@@ -93,6 +93,8 @@ After=network-online.target
 
 [Service]
 Environment=GGML_MMVQ_MAX=$MMVQ_MAX
+Environment=GGML_MMVQ_MAX_Q6K=8
+Environment=GGML_MMVQ_MAX_IQ4XS=8
 Environment=LLAMA_SPEC_CHAIN=1
 Environment=LLAMA_SPEC_CHAIN_SUB=$CHAIN_SUB
 Environment=LLAMA_SCHED_POOL=8
