@@ -260,6 +260,44 @@ The last column is the honest efficiency metric: how much a stack spends above t
 
 That last number is the useful one. **100 tok/s for this model at this quantization is reachable, and this software reaches it — it needs about 913 GB/s of memory bandwidth to do so.** A 3090 (936), a 4090 (1008) or an L40S (864, ~95 tok/s) are in that class. An L4 at 300 GB/s is not, and no amount of software closes a 3x hardware gap. The work in this repository is portable to those cards unchanged; the patch, the draft head and the flags are all bandwidth-agnostic.
 
+## A purpose-built tree-drafting engine, measured head to head
+
+llama.cpp has no tree drafting, and this file argues above that tree drafting is the most promising unexploited idea here: verification width is nearly free up to the MMQ tile boundary, so spending that width on several candidate branches instead of one chain should raise accepted length. [Lucebox](https://github.com/Luce-Org/lucebox) is an engine built on exactly that premise. It ships DDTree, publishes speedups of 2x to 5.6x over vendored llama.cpp on Qwen 3.6 27B, and takes GGUF input, so it can be pointed at this repository's model file unchanged. It was worth measuring rather than reasoning about.
+
+It runs. Lucebox loads `Qwen3.8-27B-UD-Q4_K_XL.gguf`, recognizes `family:qwen35`, and engages DDTree with the Qwen3.6 DFlash drafter in 18.7 GiB. All numbers below use one streaming probe against both servers, counting deltas between first and last token so prefill is excluded, which reproduces llama.cpp's own `predicted_per_second` to within 2%.
+
+The first result is the one that localizes everything else:
+
+| | decode |
+| --- | --- |
+| llama.cpp, no speculation | 14.98 tok/s |
+| **Lucebox, no drafter** | **14.77 tok/s** |
+
+A dead heat, which is what a 15.75 GiB weight read at a fixed bandwidth should produce in any engine. Whatever Lucebox wins elsewhere, it does not win it in the kernels. Their advantage is entirely in the speculative layer, so the question becomes whether their tree beats this repository's chain.
+
+**Table 8: DDTree budget sweep, Qwen3.6 DFlash drafter against the Qwen3.8 target, on prose / code / json.**
+
+| DDTree budget | Decode | Tokens per target forward |
+| --- | --- | --- |
+| 4 | 21.47 | 2.12 |
+| 8 | 21.03 | 2.23 |
+| 12 | 20.67 | 2.23 |
+| 16 | 23.00 | 2.53 |
+| 22 (their default) | 24.13 | 2.64 |
+| **32** | **25.17** | |
+| 48 | 22.17 | |
+| 64 | 21.37 | |
+| 96 | out of memory | |
+| **this repository, same probe** | **31.35** | **3.01** |
+
+The tree works exactly as advertised: tokens committed per target forward climb monotonically with budget, 2.12 to 2.64, and llama.cpp cannot do that at all. It is still not enough. At its best budget Lucebox reaches 25.17 against 31.35 here, 20% behind, because 2.64 tokens per forward loses to the native MTP head's 3.01 and the wider verification costs more on a card with 300 GB/s and a 72 W cap than it returns.
+
+The reason is not the engine, it is the drafter, and the drafter situation is specific to this model being three days old. Lucebox drives DFlash and DSpark drafters; it has no MTP path, so the one strong drafter this model ships cannot be fed to its tree. No Qwen3.8 DFlash drafter exists on its side, only the Qwen3.6 one used above. Training a native one is not obviously the fix either: the only published SpecForge-trained Qwen3.8 DFlash drafter reports 1.81 accepted tokens per step, *worse* than the 2.02 of the Qwen3.6 weights transplanted, so the artifact that exists is undertrained rather than merely absent.
+
+Two caveats, because the comparison is not perfectly clean. Lucebox served these requests with `thinking=false` while this repository's configuration reasons, so the two are generating different text from the same prompts; and Lucebox was given 32,768 context against 65,536 here, which this file measures as worth nothing in throughput but which is not nothing in fairness. Neither moves a 20% gap.
+
+The useful conclusion is a decomposition. Tree drafting is the better verification mechanism and is worth roughly half a token per forward on this evidence. A well-matched drafter is worth more. This model gives away the second to get the first, and on this hardware that trade loses.
+
 ## The 72 W wall
 
 The L4 is a single-slot card with no auxiliary power connector, so it lives inside the PCIe slot budget. `nvidia-smi` reports min 40 W, default 72 W, **max 72 W**: the cap cannot be raised, only lowered. That turns out to matter more than it looks, and it is a second wall standing independently of the drafter.
