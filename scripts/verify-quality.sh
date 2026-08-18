@@ -1,19 +1,22 @@
-#!/bin/bash
-# Quality verification for a speed change. Two independent tests, because the first one
-# alone is misleading.
+#!/usr/bin/env bash
+# Quality verification for the tuned configuration. Two independent tests, because the
+# first one alone is misleading.
 #
 #   1. Greedy determinism  -- byte-compare output against --spec-type none.
 #   2. Verifiable accuracy -- 40 arithmetic problems with known ground truth.
 #
 # Test 1 is EXPECTED TO FAIL under speculative decoding, and that is not a regression.
 # Accepting a drafted token changes the batch shape of the forward pass, which changes
-# float reduction order, which flips tokens that were near-ties. Test 2 is the one that
-# decides whether quality actually moved.
+# float reduction order, which flips tokens that were near-ties. Test 2 decides whether
+# quality actually moved.
 #
-# Run ON the instance:
-#   gcloud compute scp scripts/verify-quality.sh <inst>:~/ --zone=<zone>
-#   gcloud compute ssh <inst> --zone=<zone> --command 'bash ~/verify-quality.sh'
+# Run ON the instance:  bash ~/verify-quality.sh
+# Env: BIN (dir holding bin/llama-server), MODEL, DRAFT, CTX
 set -u
+BIN="${BIN:-$HOME/lcpp}"
+MODEL="${MODEL:-/opt/models/model.gguf}"
+DRAFT="${DRAFT:-/opt/models/mtp-o2k.gguf}"
+CTX="${CTX:-8192}"
 
 cat > /tmp/_det.py <<'PY'
 import json,urllib.request,sys
@@ -29,7 +32,7 @@ def call(p):
     body={"messages":[{"role":"user","content":p}],"max_tokens":400,"temperature":0,
           "seed":42,"cache_prompt":False}
     r=urllib.request.urlopen(urllib.request.Request(f"http://{IP}/v1/chat/completions",
-        data=json.dumps(body).encode(),headers={"Content-Type":"application/json"}),timeout=300)
+        data=json.dumps(body).encode(),headers={"Content-Type":"application/json"}),timeout=600)
     m=json.load(r)["choices"][0]["message"]
     return (m.get("reasoning_content") or "")+"|||"+(m.get("content") or "")
 json.dump({k:call(p) for k,p in PROMPTS}, open(sys.argv[1],"w"))
@@ -48,7 +51,7 @@ for q,gt in Q:
     body={"messages":[{"role":"user","content":q}],"max_tokens":900,"temperature":0,
           "seed":42,"cache_prompt":False,"chat_template_kwargs":{"enable_thinking":False}}
     r=urllib.request.urlopen(urllib.request.Request(f"http://{IP}/v1/chat/completions",
-        data=json.dumps(body).encode(),headers={"Content-Type":"application/json"}),timeout=300)
+        data=json.dumps(body).encode(),headers={"Content-Type":"application/json"}),timeout=600)
     c=json.load(r)["choices"][0]["message"].get("content") or ""
     d="".join(ch for ch in c if ch.isdigit() or ch=="-")
     good = d.strip()==str(gt)
@@ -59,20 +62,28 @@ for b in bad[:5]: print("    MISS:",b)
 PY
 
 start() {
-  sudo docker rm -f llama-server >/dev/null 2>&1
-  sudo docker run -d --name llama-server --gpus all -p 8080:8080 -v /opt/models:/models \
-    ghcr.io/ggml-org/llama.cpp:server-cuda --model /models/model.gguf --alias v \
-    --host 0.0.0.0 --port 8080 --jinja --tools all --ctx-size ${CTX:-65536} --parallel 1 \
-    --flash-attn on -ngl 99 -ub 64 -b 512 --no-mmap --threads 8 --no-warmup --metrics \
-    "$@" >/dev/null 2>&1
-  for i in $(seq 1 60); do
-    curl -fsS --max-time 3 http://127.0.0.1:8080/health 2>/dev/null | grep -q ok && return
-    sleep 2
+  local envs="$1"; shift
+  pkill -f "bin/llama-server" 2>/dev/null
+  for i in $(seq 1 60); do pgrep -f "bin/llama-server" >/dev/null || break; sleep 1; done
+  pkill -9 -f "bin/llama-server" 2>/dev/null
+  for i in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":8080 " || break; sleep 1; done
+  sleep 1
+  ( cd "$BIN"
+    export LD_LIBRARY_PATH="$BIN/bin:/usr/local/cuda-12.9/lib64:${LD_LIBRARY_PATH:-}"
+    if [ "$envs" != "-" ]; then IFS=',' read -ra E <<< "$envs"; for e in "${E[@]}"; do export "$e"; done; fi
+    setsid nohup ./bin/llama-server --model "$MODEL" --alias v --host 0.0.0.0 --port 8080 \
+      --jinja --tools all --ctx-size "$CTX" --parallel 1 --flash-attn on -ngl 99 \
+      -ub 512 -b 512 --no-mmap --threads 8 --no-warmup --metrics "$@" \
+      > /tmp/vq-server.log 2>&1 < /dev/null & )
+  for i in $(seq 1 240); do
+    curl -fsS --max-time 3 http://127.0.0.1:8080/health 2>/dev/null | grep -q ok && return 0
+    sleep 1
   done
+  echo "  server failed to start"; return 1
 }
 
-echo "== capturing: no speculation (reference) =="
-start --spec-type none
+echo "== reference: no speculation, stock kernel selection =="
+start - --spec-type none
 python3 /tmp/_det.py /tmp/out_nospec.json
 echo "-- control: same config twice, is the server deterministic at all?"
 python3 /tmp/_det.py /tmp/out_nospec2.json
@@ -85,15 +96,16 @@ echo "-- accuracy (reference)"
 python3 /tmp/_acc.py
 
 echo
-echo "== capturing: plain MTP n=2 =="
-start --spec-type draft-mtp --spec-draft-n-max 2
-python3 /tmp/_det.py /tmp/out_mtp.json
+echo "== MMQ crossover only (GGML_MMVQ_MAX=2), no speculation =="
+start GGML_MMVQ_MAX=2 --spec-type none
+python3 /tmp/_det.py /tmp/out_mmq.json
 echo "-- accuracy"
 python3 /tmp/_acc.py
 
 echo
-echo "== capturing: MTP n=2 + p-min 0.4 (shipped config) =="
-start --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.4
+echo "== shipped tuned config: MMQ crossover + MTP sidecar n=5 =="
+start GGML_MMVQ_MAX=2 --spec-type draft-mtp --spec-draft-model "$DRAFT" \
+  --spec-draft-ngl 99 --spec-draft-n-max 5 --spec-draft-n-min 5 --spec-draft-p-min 0.0
 python3 /tmp/_det.py /tmp/out_opt.json
 echo "-- accuracy"
 python3 /tmp/_acc.py
@@ -103,11 +115,13 @@ echo "== byte-comparison =="
 python3 - <<'PY'
 import json
 ref=json.load(open("/tmp/out_nospec.json"))
-mtp=json.load(open("/tmp/out_mtp.json"))
+mmq=json.load(open("/tmp/out_mmq.json"))
 opt=json.load(open("/tmp/out_opt.json"))
-print("  task    mtp_vs_nospec   opt_vs_mtp")
+print("  task    mmq_vs_nospec   tuned_vs_nospec")
 for k in ref:
-    print("  %-6s  %-14s  %-12s" % (k, mtp[k]==ref[k], opt[k]==mtp[k]))
+    print("  %-6s  %-14s  %-14s" % (k, mmq[k]==ref[k], opt[k]==ref[k]))
 print()
-print("  Byte divergence is expected under speculation; judge on accuracy, not bytes.")
+print("  Byte divergence under speculation is expected; judge on accuracy, not bytes.")
+print("  mmq_vs_nospec is the interesting column: it isolates the kernel change from")
+print("  speculation, and should be True if the MMQ path is numerically equivalent.")
 PY

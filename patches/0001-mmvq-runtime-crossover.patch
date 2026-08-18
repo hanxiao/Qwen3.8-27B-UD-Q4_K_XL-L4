@@ -1,0 +1,39 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index cd2dfc7..89e616b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2783,7 +2783,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
+             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
+         }
+ 
+-        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
++        LOG_INF("spec statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+                 common_speculative_type_to_str(impl->type).c_str(),
+                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
+                 impl->n_gen_drafts,
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0589e65..b6d8d53 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include <cstdlib>
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -280,6 +281,15 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+ }
+ 
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
++    // GGML_MMVQ_MAX: override the MMVQ batch ceiling at runtime (default MMVQ_MAX_BATCH_SIZE).
++    // Setting it below 8 pushes those batch widths onto MMQ (int8 tensor cores) instead.
++    static const int64_t mmvq_max_env = []() -> int64_t {
++        const char * s = getenv("GGML_MMVQ_MAX");
++        return s ? atoll(s) : (int64_t) MMVQ_MAX_BATCH_SIZE;
++    }();
++    if (ne11 > mmvq_max_env) {
++        return false;
++    }
+     if (!ggml_is_quantized(type)) {
+         return false;
+     }

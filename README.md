@@ -1,34 +1,116 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 23 tok/s decode over a 104,192-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That context is the largest the card will serve at this quantization.
+Qwen3.8-27B serves at 31.0 tok/s decode over a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.28x the 24.1 tok/s this repository previously served, at identical quantization and with no measured quality regression.
 
 ```bash
 gcloud config set project <your-project>
 bash scripts/provision-ondemand.sh
 ```
 
-That command creates the instance, fetches the model, starts an OpenAI-compatible server and blocks until it answers on `/health`. Every number below was measured on the machine it provisions, on 2026-08-14.
+That command creates the instance, fetches the model and the draft head, builds a patched llama.cpp, starts an OpenAI-compatible server and blocks until it answers on `/health`. Every number below was measured on the machine it provisions, on 2026-08-18.
 
-## Architecture
+## Summary of the change
 
-Qwen3.8-27B uses hybrid attention, and that is why a 27B model is practical on a 24 GB card. Its `config.json` reports 64 layers with `full_attention_interval` of 4, so 16 layers maintain a KV cache and the remaining 48 use linear attention. The model ships a native MTP draft head, `mtp_num_hidden_layers` of 1, and supports positions up to 262,144.
+Three things moved throughput, in descending order of size. None of them changes the weights, the quantization, or the sampling: speculative decoding emits a drafted token only after the target model verifies it, and the kernel change swaps which CUDA kernel evaluates the same matmul. Both can reorder floating-point reductions and so flip tokens that were near ties; measured accuracy is unchanged, and the Quality section reports the checks.
 
-Because only one layer in four holds a KV cache, context costs roughly a quarter of what it costs on a conventional dense model of this size. A genuinely dense Qwen3.5-27B at Q6_K on this same card reaches 10 tok/s and stops at 71K context. Qwen3.8-27B sustains 2.4 times that throughput while serving 104K, and its ceiling follows the VRAM budget.
+| Change | Decode (tok/s) | Delta |
+| --- | --- | --- |
+| Previous configuration (MTP n-max 2, p-min 0.4) | 24.14 | |
+| Route speculative verification to the MMQ kernel | 28.05 | +16.2% |
+| Draft from a separate, cheaper MTP head | 30.39 | +8.3% |
+| Retype that head's output tensor to Q2_K, n-max 5 | 30.7 | +1.1% |
+| Sample on the GPU (`-bs`) instead of copying 248,320 logits per verified position to the host | **31.0** | +0.9% |
 
-A sparse MoE of similar size remains faster. [Qwen3.6-35B-A3B with MTP on the same L4](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) reaches 92-100 tok/s because it activates roughly 3B parameters per token. Choose 35B-A3B for throughput and this model for a compact dense-class model with native vision.
+The first change is the interesting one, and it is a one-line patch to llama.cpp. The rest of this README explains why, because the reasoning generalizes to any speculative decoding setup on a compute-poor card.
+
+## The cost model
+
+Everything below follows from three measured quantities. Table 1 gives the first.
+
+**Table 1: where the time goes in one decode step.**
+
+| Quantity | Value | How it was measured |
+| --- | --- | --- |
+| Weights read per target forward pass | 15.75 GiB | GGUF tensor table, minus `token_embd` (682 MiB, a row lookup) and `blk.64` (272 MiB, the MTP block, not in the trunk graph) |
+| Target forward pass, batch 1 | 66.9 ms | `--spec-type none` decode at 14.95 tok/s |
+| Effective memory bandwidth | 252.8 GB/s | 15.75 GiB / 66.9 ms, against a 300.05 GB/s datasheet peak |
+
+Decode is memory-bound and llama.cpp already reaches 84% of the datasheet peak, which is close to what GDDR6 delivers in practice. Locking the SM clock anywhere between 900 and 2040 MHz changes throughput by less than 2%, and at 900 MHz the card draws 63.6 W against a 72 W cap, so the clock is not the limit either. There is nothing to win in the batch-1 pass.
+
+Throughput therefore depends entirely on how many tokens each of those 66.9 ms passes emits:
+
+```
+tok/s = mean accepted length / (verify pass cost + drafting cost)
+```
+
+## Why verification width was the bottleneck
+
+llama.cpp picks between two quantized matmul kernels by batch width. `ggml_cuda_should_use_mmvq` returns true for `ne11 <= MMVQ_MAX_BATCH_SIZE`, which is 8, and `ggml_cuda_mul_mat` consults it before `ggml_cuda_should_use_mmq`. So every speculative verification batch, which is `n_draft + 1` and therefore 3 to 9 tokens wide, lands on `mul_mat_vec_q`. That kernel runs on CUDA cores. `mul_mat_q` runs on the int8 tensor cores and is never reached.
+
+Table 2 is the consequence. Both columns verify identical batches of identical weights.
+
+**Table 2: cost of one target forward pass against verification width.**
+
+| Verify width | `mul_mat_vec_q` (stock) | `mul_mat_q` (`GGML_MMVQ_MAX=2`) |
+| --- | --- | --- |
+| 1 | 66.9 ms | n/a, MMVQ is correct at batch 1 |
+| 2 | | 74.1 ms |
+| 3 | 85.5 ms | 80.6 ms |
+| 4 | 111.7 ms | 83.2 ms |
+| 8 | | 89.7 ms |
+| 12 | | 100.1 ms |
+| 16 | | 106.2 ms |
+
+Under MMVQ each additional verified token costs 9 ms going from width 1 to 3 and 26 ms going from 3 to 4. Under MMQ the whole range from 2 to 16 costs 2.3 ms per token. That is the difference between a draft depth of 2 being optimal and a draft depth of 5 being optimal, and it is worth 16%.
+
+This is not reachable by configuration. `GGML_CUDA_FORCE_MMQ` is a compile-time flag evaluated inside `ggml_cuda_should_use_mmq`, which the dispatcher never calls once `ggml_cuda_should_use_mmvq` has returned true. `patches/0001-mmvq-runtime-crossover.patch` adds a `GGML_MMVQ_MAX` environment variable to that one predicate. Setting it to 2 keeps MMVQ for plain batch-1 decode, where MMVQ is genuinely faster, and routes everything wider to MMQ.
+
+## Why the draft head was replaced
+
+The second cost in the model is drafting. Qwen3.8-27B ships a native MTP block, and llama.cpp drafts by running that block plus an output projection once per drafted token. The block is 272 MiB. The output projection is the target's own `output.weight`, which at Q6_K over a 248,320-token vocabulary is 994.6 MiB, so 78% of each draft step is the LM head.
+
+`ggml-org/Qwen3.8-27B-GGUF` publishes the MTP block as a standalone sidecar carrying its own embedding and output tensors at Q4_0. Pointing `--spec-draft-model` at it replaces the Q6_K head with a Q4_0 one. Retyping that file's output tensor to Q2_K with `llama-quantize --output-tensor-type q2_K` shrinks it further. Draft precision is not output precision: the target verifies every token, so a coarser draft head can only change how often a draft is accepted, never what is emitted.
+
+**Table 3: cost of one draft step.**
+
+| Draft head | Output tensor | Read per step | Predicted at 252.8 GB/s | Measured | Mean accepted length, n-max 5 |
+| --- | --- | --- | --- | --- | --- |
+| Embedded in the target GGUF | 994.6 MiB Q6_K | 1.237 GiB | 5.25 ms | 4.9-5.3 ms | 2.88 |
+| `mtp-Qwen3.8-27B-Q4_0.gguf` sidecar | 682.0 MiB Q4_0 | 0.888 GiB | 3.77 ms | 3.94 ms | 2.99 |
+| **Same, output tensor retyped Q2_K** | **397.9 MiB Q2_K** | **0.611 GiB** | **2.60 ms** | **2.73 ms** | **3.01** |
+
+Read per step is the output tensor plus the 227.6 MiB MTP block; the embedding is a row lookup and is not read. All three land within 5% of what bandwidth alone predicts, so drafting is bandwidth-bound too and shrinking the head is the only lever on it.
+
+Accepted length does not fall across a 2.0x change in head size, so the whole saving is real. Q3_K sits between Q4_0 and Q2_K in size but measured worse than both, 28.89 tok/s against 29.20 and 29.91 on the same two workloads: its first-position acceptance fell to 0.746, against 0.779 for Q4_0 and 0.763 for Q2_K, which cost more than the bandwidth it saved. Q2_K is the floor that still holds acceptance.
 
 ## Serving configuration
 
 ```
---ctx-size 104192 --parallel 1 --flash-attn on -ngl 99
--ub 64 -b 512 --no-mmap --threads 8
---spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.4
---jinja --tools all --metrics
+--ctx-size 65536 --parallel 1 --flash-attn on -ngl 99
+-ub 512 -b 512 --no-mmap --threads 8
+--spec-type draft-mtp
+--spec-draft-model /opt/models/mtp-o2k.gguf --spec-draft-ngl 99
+--spec-draft-n-max 5 --spec-draft-n-min 5 --spec-draft-p-min 0.0
+-bs --jinja --tools all --metrics
 ```
 
-llama.cpp divides `--ctx-size` across slots, so `--parallel 1` gives a single slot the full context instead of splitting it. The context and the two speculative parameters are measured optima, reported below. Override any of them through the environment, as in `CTX=65536 bash scripts/provision-ondemand.sh`.
+with `GGML_MMVQ_MAX=2` in the environment.
 
-ECC must be disabled. Turning it off with `nvidia-smi -e 0` and rebooting returns about 1 GB of VRAM, and this configuration does not fit without it. The provisioning script performs this on first boot.
+`--spec-draft-p-min 0.0` reverses the previous configuration, which used 0.4. The confidence gate exists to suppress drafts that are likely to be rejected, and it was worth 4% when a draft step cost 5.3 ms and a rejected draft made verification 26 ms more expensive. At 2.73 ms per draft step and 2.3 ms per unit of verification width, a rejected draft is cheap enough that suppressing it costs more than it saves. Measured at n-max 3 with the cheap head: p-min 0.0 gives 28.71 tok/s, 0.3 gives 27.11, 0.5 gives 26.17, 0.6 gives 25.13.
+
+`--spec-draft-n-min` equal to `--spec-draft-n-max` fixes the draft length, which keeps the verification batch a constant shape and improves CUDA graph reuse.
+
+`-bs` moves sampling onto the GPU. Without it the server copies a full logit row, 248,320 floats or 993 KB, to the host for every verified position; at width 6 that is roughly 6 MB per decode cycle over PCIe gen3 plus a host-side argmax. It is worth about 1%, small because the copy partly overlaps, but it is free.
+
+ECC must be disabled, as before. `nvidia-smi -e 0` plus a reboot returns about 1 GB of VRAM, and this configuration does not fit without it. The provisioning script performs this on first boot.
+
+## Architecture
+
+Qwen3.8-27B uses hybrid attention, and that is why a 27B model is practical on a 24 GB card. Its `config.json` reports 64 layers with `full_attention_interval` of 4, so 16 layers maintain a KV cache and the remaining 48 use linear attention (Gated DeltaNet). The model ships a native MTP draft head, `mtp_num_hidden_layers` of 1, and supports positions up to 262,144.
+
+Because only one layer in four holds a KV cache, context costs roughly a quarter of what it costs on a conventional dense model of this size. A genuinely dense Qwen3.5-27B at Q6_K on this same card reaches 10 tok/s and stops at 71K context.
+
+A sparse MoE of similar size remains faster. [Qwen3.6-35B-A3B with MTP on the same L4](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) reaches 92-100 tok/s because it activates roughly 3B parameters per token, so it reads about a fifth as many bytes per token. Choose 35B-A3B for throughput and this model for a compact dense-class model with native vision.
 
 Thinking is enabled by default. Reasoning arrives in `reasoning_content` and the answer in `content`. A small `max_tokens` budget is consumed entirely by reasoning and returns an empty `content`, so use at least 512, or disable thinking per request with `{"chat_template_kwargs": {"enable_thinking": false}}`.
 
@@ -42,11 +124,146 @@ curl -s http://<IP>:8080/v1/chat/completions -H 'Content-Type: application/json'
 
 The instance also serves a web UI on port 8080, Prometheus metrics at `/metrics`, and live slot configuration at `/props`.
 
+## Performance
+
+Table 4 reports decode throughput from `scripts/bench.sh`. The metric is `timings.predicted_per_second`, which excludes prompt processing, measured with `cache_prompt` disabled, greedy sampling, 256 max tokens, averaged over two runs per workload. Mean accepted length is tokens emitted per target forward pass, which is the quantity the cost model is written in.
+
+**Table 4: decode throughput and mean accepted length by workload.**
+
+| Workload | Previous (tok/s) | Tuned (tok/s) | Speedup | Tuned mean accepted length |
+| --- | --- | --- | --- | --- |
+| math | 24.54 | **36.48** | 1.49x | 3.53 |
+| multi-turn | 23.69 | **32.61** | 1.38x | 3.16 |
+| summarization | 24.63 | **31.97** | 1.30x | 3.10 |
+| prose | 22.96 | **29.64** | 1.29x | 2.88 |
+| code | 23.67 | **29.39** | 1.24x | 2.86 |
+| json | 22.92 | **28.83** | 1.26x | 2.78 |
+| chat | 23.24 | **27.85** | 1.20x | 2.70 |
+| **average** | **24.18** | **30.97** | **1.28x** | **3.01** |
+
+The previous column is this repository's earlier measurement; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. Three full passes of the configuration without `-bs` gave 30.80, 30.71 and 30.68; adding `-bs` gave 30.98 at 81,920 context and 30.97 at the shipped 65,536, the latter being the table above.
+
+Structured reasoning speculates best and open-ended chat worst, which is the usual shape: the gain tracks how predictable the next token is, and `math` reaches 3.53 accepted tokens per pass against `chat` at 2.70.
+
+Throughput is flat against context. At 32,768 / 65,536 / 81,920 the same configuration measures 29.63 / 29.51 / 29.60 tok/s on a two-workload subset, and the full benchmark gives 30.97 at 65,536 against 30.98 at 81,920. Context is a memory question, not a speed one, which is why the shipped default is the one that leaves headroom rather than the one that fits.
+
+## Can this reach 100 tok/s
+
+No, and the arithmetic is worth writing down because it bounds the whole problem rather than this particular implementation.
+
+100 tok/s is 10 ms per token. One target forward pass reads 15.75 GiB of weights, and that read is unavoidable: the model is dense, every byte is touched once per pass, and there is no reuse to exploit. At the measured 252.8 GB/s that pass costs 66.9 ms, and at the datasheet 300.05 GB/s it would still cost 56.4 ms. So a pass must emit at least 6.7 tokens, and that is before charging anything for drafting or for the extra width of the verification batch.
+
+Mean accepted length is therefore the entire problem, and Table 5 says where it actually is.
+
+**Table 5: mean accepted length, measured and published.**
+
+| Drafter | Mean accepted length | Source |
+| --- | --- | --- |
+| Native MTP head, draft depth 2 | 2.47 | measured here |
+| Native MTP head, draft depth 5 | 3.01 | measured here |
+| Native MTP head, draft depth 11 or more | 3.21 | measured here, saturated |
+| `DimInfer/Qwen3.8-27B-Dspark-v1`, block 15 | 2.67 | measured here |
+| Same, on this quantization | 3.23 | published by its author |
+| Same, on Q4_K_M, GSM8K | 4.09 | published by its author, the highest figure found for this model |
+
+The MTP head saturates at 3.21 because its per-position acceptance decays: 0.78, 0.55, 0.35, 0.25, 0.18, 0.10, 0.07. Drafting deeper adds cost and almost no accepted tokens. Nothing published for Qwen3.8-27B reaches 6.7. The gap is a factor of 1.6 against the best figure reported for this model on any quantization, and 2.1 against the best reported on this one.
+
+Two idealized bounds make the headroom concrete. Give drafting away for free and keep the measured verification cost: 3.21 / 100.1 ms is 32.1 tok/s. Give away drafting *and* all verification width, so every pass costs the bare 66.9 ms weight read: 3.21 / 66.9 ms is 48.0 tok/s. The configuration here reaches 31.0, which is 97% of the first bound. The remaining distance to 100 tok/s is not implementation slack. It is the drafter.
+
+What would close it is a draft head with mean accepted length near 7, which means a trained head rather than a better-tuned one. The published recipes that reach 5.3 to 5.5 on comparable targets regenerate 12,000 to 40,000 answers from the served quantized target, capture hidden states from the GGUF itself, warm-start from an existing head of the same geometry, and train for 6 to 10 hours on a 96 GB card. That is the identified next step, and it is a training project, not a serving one. A second, cheaper lever is tree drafting: verification width is now nearly free up to 16 tokens, so spending that width on several candidate branches instead of one chain should raise accepted length by roughly a third. llama.cpp has no tree support in any speculative implementation, and adding it needs per-token attention masks that the current API does not expose.
+
+## What did not work
+
+Measured and rejected, so they need not be tried again.
+
+| Attempt | Result |
+| --- | --- |
+| `DimInfer/Qwen3.8-27B-Dspark-v1`, block-15 DSpark head | 23.96 tok/s over seven workloads, a tie with MTP. Its accepted length is better but it runs two draft-model forwards per cycle, one of which routes target hidden states through host memory, and that erases the gain on a card this compute-poor. |
+| `RadixArk` / `erlidev` block-7 DSpark heads | 18.6 to 23.1 tok/s, worse. Per-position acceptance 0.81, 0.39, 0.18. |
+| n-gram and suffix drafting (`ngram-mod`, `ngram-simple`, `ngram-map-k`) | Never fires. Over a 256-token generation from a short prompt it produced 0 to 7 draft tokens total. There is no repeated history to mine at this generation length. |
+| Locking SM clocks (900, 1200, 1500, 2040 MHz) | Within 2%. Decode is bandwidth-bound, and at 900 MHz the card draws 63.6 W against a 72 W cap, so it is not power-bound either. |
+| `-ub` 64 to 512, `-b`, `--threads` 4 to 8, `--flash-attn off`, `--no-op-offload` | All within 0.7% at batch 1. Re-swept on the tuned configuration, `-ub` 16 / 32 / 64 / 128 / 256 gave 29.92 / 28.70 / 29.87 / 29.15 / 29.16, a 1.2 tok/s spread with no trend. `-ub 512` is kept because it helps prefill, which decode does not care about. |
+| `GGML_CUDA_GRAPH_OPT=1` | 29.33 against 29.36. Its fusion pattern requires a three-way fan-out at batch 1, which only 16 of this model's 64 blocks have. |
+| `GGML_CUDA_DISABLE_FUSION=1` (control) | 28.45 against 29.36, so the existing fusions are worth about 3% and should be left on. |
+| llama.cpp master (commit `01818e4`) against the pinned b10454 | 23.38 against 23.60, no difference. |
+| Draft head output tensor at Q3_K | 28.89 against Q4_0's 29.20 and Q2_K's 29.91. Acceptance fell faster than bandwidth. |
+| Raising `--spec-draft-p-min` with the cheap head | Monotonically worse: 28.71 at 0.0 down to 25.13 at 0.6. |
+
+A note on one misleading measurement, because it cost time. Measuring forward-pass cost by timing prompt processing shows a 3.3x step between width 4 and width 5, which does not exist in the decode path: the same widths measured through actual speculative decoding are flat. Prompt processing and speculative verification take different paths through the server. Measure the path you intend to optimize.
+
+## Memory and context capacity
+
+The draft head is a second model resident in VRAM, so it is paid for in context. Table 6 reports VRAM with the server loaded and idle, on a 24,089 MiB device.
+
+**Table 6: VRAM against context size, tuned configuration.**
+
+| `--ctx-size` | VRAM used | Free |
+| --- | --- | --- |
+| 8,192 | 18,960 MiB | 5,129 MiB |
+| 32,768 | 20,616 MiB | 3,473 MiB |
+| **65,536 (default here)** | **22,848 MiB** | **1,722 MiB** |
+| 81,920 | 23,946 MiB | 143 MiB, loads and benchmarks but is not safe, see below |
+| 90,112 | fails to load | |
+
+**81,920 loads, serves, and benchmarks at full speed, and still crashes.** llama.cpp instantiates a CUDA graph per distinct batch shape, and instantiation allocates. With 143 MiB free, the first request whose shape has not been seen before aborts the process:
+
+```
+ggml-cuda.cu:106: CUDA error
+CUDA error: out of memory
+  cudaGraphInstantiate(&graph->instance, graph->graph, __null, __null, 0)
+```
+
+The seven-workload benchmark never triggers it because it replays the same seven shapes, so the number looks fine right up until real traffic arrives. It surfaced only when the 40-prompt accuracy check ran, with `enable_thinking` off and 40 distinct short prompts, and took the server down twice. The fix is headroom, not a smaller graph: 65,536 leaves 1.7 GiB, survives the same stress with zero restarts, and costs nothing measurable in throughput. Treat "fits at idle" as necessary and not sufficient, and validate a context ceiling with varied prompt shapes rather than with the benchmark.
+
+The trade is therefore 65,536 tokens at 31.0 tok/s against 104,192 tokens at 24.1. Sixteen of the 64 layers keep a KV cache, at 64 KiB per token, and the draft context adds 4 KiB per token, so context costs 68 KiB per token against 64 KiB before.
+
+If the full 104,192 matters more than the last 9%, drop `--spec-draft-model` and keep the kernel patch. That configuration measures 28.05 tok/s, needs no second model, and fits the original context: it is `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 3 --spec-draft-p-min 0.0` with `GGML_MMVQ_MAX=2`.
+
+## Quality
+
+`scripts/verify-quality.sh` runs two independent checks against a `--spec-type none` reference: byte-level determinism and accuracy on 40 arithmetic problems with known ground truth. It captures three configurations so the kernel change and speculation can be told apart.
+
+**Table 7: quality checks.**
+
+| Configuration | Accuracy | Byte-identical to reference, per task |
+| --- | --- | --- |
+| No speculation, stock kernel selection (reference) | 40/40 | reference; identical to itself across two runs |
+| No speculation, `GGML_MMVQ_MAX=2` | 40/40 | 3 of 5 |
+| Shipped configuration | 40/40 | 3 of 5 |
+
+Accuracy is unchanged. Byte-level output is not, and neither divergence is a regression.
+
+Speculative decoding is lossless by construction, since a drafted token is emitted only after the target verifies it, but accepting a drafted token changes the batch shape of the forward pass and therefore the order of floating-point reduction, which flips tokens that were near ties. The middle row isolates the same effect for the kernel change alone, with speculation held out: `mul_mat_q` and `mul_mat_vec_q` accumulate the same products in a different order, so two of the five prompts diverge on a near-tie token. Running any one configuration twice is byte-identical, so the server itself is deterministic and the divergence is a property of the reduction order, not of run-to-run noise.
+
+If you need bit-exact reproducibility against a previously captured reference, run `--spec-type none` without `GGML_MMVQ_MAX` at roughly 15 tok/s.
+
+## Reproducing
+
+```bash
+ZONE=$(gcloud compute instances list --filter="name=qwen38-27b-l4-od" --format='value(zone)')
+gcloud compute scp scripts/bench.sh scripts/verify-quality.sh qwen38-27b-l4-od:~/ --zone=$ZONE
+gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo apt-get install -y -qq bc; bash ~/bench.sh 127.0.0.1:8080'
+gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'BIN=/opt/llama.cpp/build bash ~/verify-quality.sh'
+```
+
+`verify-quality.sh` stops the running server, cycles three configurations and leaves the last one up, so restart the unit afterwards with `sudo systemctl restart qwen-server`.
+
+Run the benchmark on the instance. It uses bash 4 associative arrays, which the bash 3.2 shipped with macOS does not support.
+
+To rebuild llama.cpp yourself, on any CUDA machine:
+
+```bash
+bash scripts/build-llamacpp.sh ~/lcpp
+```
+
+The build pins llama.cpp at b10454, applies `patches/0001-mmvq-runtime-crossover.patch`, and targets SM89 only. On 32 vCPUs it takes about four minutes; on the 8 vCPUs of a `g2-standard-8` allow twenty. Building on a separate CPU instance and copying `bin/` to `/opt/llama.cpp/build/bin` is faster and keeps the benchmark machine idle.
+
+The patch is one predicate in `ggml/src/ggml-cuda/mmvq.cu` plus a log-level change in `common/speculative.cpp` that promotes llama.cpp's own speculative statistics (mean accepted length, per-position acceptance, cumulative drafting time) from trace to info. Every number in the cost model above came from that line; without it the only way to see drafting cost is `-lv 6`, which logs every draft candidate and slows generation by 30%.
 ## Network access
 
-The server binds `0.0.0.0` and has no authentication, so the firewall is the only thing standing between the model and the internet. The provisioning script opens `tcp:8080` to `0.0.0.0/0` through the `llama-server` tag, which is convenient for a throwaway benchmark and wrong for anything that stays up.
+The server binds `0.0.0.0` and has no authentication, so the firewall is the only thing standing between the model and the internet. The provisioning script defaults to `INTERNAL=1`, which tags the instance `llama-internal` and admits `tcp:8080` from RFC1918 only. `INTERNAL=0` opens it to `0.0.0.0/0` through the `llama-server` tag, which is convenient for a throwaway benchmark and wrong for anything that stays up.
 
-To restrict it to the VPC, put the instance on a tag whose rule only admits RFC1918 traffic:
+If an instance was created with `INTERNAL=0` and you want to close it later, move the tag rather than adding a rule:
 
 ```bash
 gcloud compute firewall-rules create allow-llama-internal-8080 \
@@ -59,7 +276,7 @@ gcloud compute instances remove-tags qwen38-27b-l4-od --zone=$ZONE --tags=llama-
 
 Removing `llama-server` is the part that matters. Firewall rules are additive, so keeping both tags leaves the permissive rule in force and the narrow rule changes nothing.
 
-The external IP stays attached. It carries outbound traffic only, which the startup script needs to reach Hugging Face and the container registry; a VM with no external IP and no Cloud NAT will boot into an empty `/opt/models`. Verify from both sides, because a closed port and a dead server look identical from outside:
+The external IP stays attached. It carries outbound traffic only, which the startup script needs to reach Hugging Face, GitHub and the Ubuntu archives; a VM with no external IP and no Cloud NAT will boot into an empty `/opt/models` and no compiler. Verify from both sides, because a closed port and a dead server look identical from outside:
 
 ```bash
 curl -m 10 http://$EXTERNAL_IP:8080/health                 # expect a timeout
@@ -69,118 +286,11 @@ gcloud compute ssh <another-vm> --command \
 
 Administrative access runs over IAP (`gcloud compute ssh --tunnel-through-iap`), so no inbound port needs to be open for operations.
 
-## Memory and context capacity
-
-Table 1 reports VRAM measured with the server loaded and idle. Weights account for 17.9 GB at every setting, and the difference is the f16 KV cache for the 16 full-attention layers, the MTP draft context and compute buffers.
-
-**Table 1: VRAM against context size, on a 24,570 MiB device.**
-
-| `--ctx-size` | VRAM used | Free |
-| --- | --- | --- |
-| 65,536 | 21,500 MiB | 3,070 MiB |
-| 90,112 | 23,138 MiB | 1,432 MiB |
-| 98,304 | 23,684 MiB | 886 MiB |
-| 102,400 | 23,956 MiB | 614 MiB |
-| 103,936 | 24,058 MiB | 512 MiB |
-| **104,192 (default here)** | **24,076 MiB** | **494 MiB** |
-| 104,448 | fails to serve | |
-
-`scripts/max-context.sh` locates the ceiling by binary search, to a tolerance of 256 tokens. A context counts as working only when the server both reaches `/health` and completes a generation, because llama.cpp allocates the KV cache at load time while some compute buffers are sized on the first decode. A context that loads can still fail under traffic.
-
-The default is the measured maximum, confirmed under load rather than at idle. A 101,815-token prompt filling 98% of the window returned a correct answer at 24.88 tok/s decode and 278 tok/s prefill. VRAM peaked at 24,082 MiB and the container stayed healthy.
-
-A build of llama.cpp other than the `server-cuda` image pinned here may size its compute buffers differently. Lower `CTX` if a different image fails to serve.
-
-## Performance
-
-Table 2 reports decode throughput from `scripts/bench.sh`, run on the instance under the shipped configuration. The metric is `timings.predicted_per_second`, which excludes prompt processing, measured with `cache_prompt` disabled, greedy sampling, 256 max tokens, averaged over two runs per workload.
-
-**Table 2: Decode throughput and MTP acceptance by workload.**
-
-| Workload | Decode (tok/s) | MTP acceptance |
-| --- | --- | --- |
-| summarization | **24.63** | 0.810 |
-| math | 24.54 | 0.803 |
-| multi-turn | 23.69 | 0.798 |
-| code | 23.67 | 0.810 |
-| chat | 23.24 | 0.762 |
-| prose | 22.96 | 0.736 |
-| json | 22.92 | 0.725 |
-
-Prefill reaches 95-114 tok/s on short prompts and 278 tok/s on a 102K-token prompt, where the cost is amortised over a longer batch.
-
-The L4 provides 300 GB/s of memory bandwidth, so reading 17.9 GB of weights once per token bounds plain autoregressive decode at approximately 16.8 tok/s. Throughput above that bound comes from speculative decoding. A measurement materially below 23 tok/s indicates that ECC is still enabled or that some layers are not resident on the GPU.
-
-## Tuning
-
-`scripts/sweep-spec.sh` reproduces this section. The sweep covers draft-side and scheduling parameters, which change how tokens are proposed but not which tokens are ultimately emitted. Target-side KV quantization is excluded because it trades quality for memory, and the objective here is speed at fixed quality.
-
-Table 3 reports the one parameter that improved throughput. `--spec-draft-p-min` suppresses drafting when the draft head is not confident, which avoids issuing a forward pass whose result would be rejected.
-
-**Table 3: Effect of the draft confidence threshold. Average is over five workloads.**
-
-| p-min | Average (tok/s) | Code (tok/s) | Code acceptance |
-| --- | --- | --- | --- |
-| off | 22.58 | 20.66 | 0.576 |
-| 0.30 | 22.92 | 22.48 | 0.686 |
-| 0.35 | 23.47 | 23.90 | 0.793 |
-| **0.40** | **23.54** | **23.90** | **0.810** |
-| 0.45 | 22.90 | 20.42 | 0.670 |
-| 0.50 | 23.23 | 23.68 | 0.817 |
-| 0.60 | 22.30 | 22.28 | 0.888 |
-| 0.80 | 21.03 | 21.60 | 0.912 |
-
-The gain concentrates on the workload that was previously slowest: code rises from 20.66 to 23.90 tok/s, and the spread across workloads narrows from 22.7-26.2 to 22.9-24.6.
-
-Acceptance is a diagnostic and not an objective. A threshold of 0.80 produces the highest acceptance in Table 3 and nearly the lowest throughput, because it suppresses productive drafts along with unproductive ones.
-
-Table 4 records the remaining parameters at their measured settings, so they need not be swept again.
-
-**Table 4: Parameters that leave throughput unchanged or reduce it.**
-
-| Parameter | Setting | Average (tok/s) | Note |
-| --- | --- | --- | --- |
-| `--spec-draft-n-max` | **2** | **21.62** | optimum |
-| | 3 | 20.70 | acceptance decays faster than draft length grows |
-| | 4 | 19.15 | |
-| | 6 | 16.11 | |
-| | 1 | 21.82 | one token per verification caps the gain |
-| `--spec-type` | `draft-mtp` | 21.93 | optimum |
-| | `draft-mtp,ngram-cache` | 20.92 | MTP already covers these patterns |
-| | `draft-mtp,ngram-map-k` | 21.79 | |
-| | `ngram-cache` | 14.87 | acceptance 0.000 on prose |
-| `-ub` | 64 to 512 | 21.64-21.67 | decode issues one token per pass |
-| `--spec-draft-n-min` | 1, 2 | 23.04, 22.28 | no gain over the default |
-| `--no-spec-draft-backend-sampling` | | 23.10 | within noise |
-| `--no-op-offload` | | 22.96 | within noise |
-
-Re-testing draft depths 3 and 4 with p-min active did not recover them, at 23.56 and 22.95 against 23.54 for depth 2.
-
-Two upstream leads do not apply here. `GGML_CUDA_MMVQ_MAX` from llama.cpp [PR#26079](https://github.com/ggml-org/llama.cpp/pull/26079) tunes the mvq to MMQ crossover and reports 25-49% gains on K-quant dense decode, but its own measurements show mvq ahead at batch sizes of 5 and below, and MTP verification here runs at batch 3. The PR is also unmerged, and the symbol is absent from the `server-cuda` image. The MTP performance regression in [issue #23774](https://github.com/ggml-org/llama.cpp/issues/23774) is specific to the Vulkan backend.
-
-## Quality
-
-`scripts/verify-quality.sh` runs two independent checks. Speculative decoding is lossless by construction, since a drafted token is emitted only after the target model verifies it, and the checks confirm this holds in practice.
-
-Byte-level output is not identical to `--spec-type none`. Two controls locate the cause. Running one configuration twice is byte-identical on all five tasks, so the server is deterministic. Plain MTP without p-min already diverges from no-speculation, so the flag is not responsible. Accepting a drafted token changes the batch shape of the forward pass and therefore the order of floating-point reduction, which flips tokens that were near ties. This property is intrinsic to speculative decoding.
-
-Correctness is the operative test. Table 5 reports accuracy on 40 arithmetic problems with known ground truth.
-
-**Table 5: Verifiable accuracy across configurations.**
-
-| Configuration | Accuracy |
-| --- | --- |
-| No speculation | 40/40 |
-| MTP n=2 | 40/40 |
-| MTP n=2 with p-min 0.4 | 40/40 |
-
-Run `--spec-type none` at roughly 16-17 tok/s when bit-exact reproducibility matters more than throughput.
-
 ## Quantizations
 
-Table 6 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
+Table 8 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
 
-**Table 6: Quantizations and fit on a 24 GB L4.**
+**Table 8: quantizations and fit on a 24 GB L4.**
 
 | File | Size | Fit |
 | --- | --- | --- |
@@ -194,26 +304,22 @@ Table 6 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggin
 | `UD-Q6_K_XL` | 25.92 GB | exceeds capacity |
 | `Q8_0` | 29.05 GB | exceeds capacity |
 
-```bash
-HF_FILE=Qwen3.8-27B-UD-Q5_K_XL.gguf CTX=65536 bash scripts/provision-ondemand.sh
-```
-
-## Reproducing the benchmark
+The provisioning script takes the target file through instance metadata:
 
 ```bash
-ZONE=$(gcloud compute instances list --filter="name=qwen38-27b-l4-od" --format='value(zone)')
-gcloud compute scp scripts/bench.sh qwen38-27b-l4-od:~/bench.sh --zone=$ZONE
-gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo apt-get install -y -qq bc; bash ~/bench.sh 127.0.0.1:8080'
+gcloud compute instances add-metadata qwen38-27b-l4-od --zone=$ZONE \
+  --metadata=qwen-hf-file=Qwen3.8-27B-UD-Q5_K_XL.gguf,qwen-ctx=49152
 ```
 
-Run the benchmark on the instance. It uses bash 4 associative arrays, which the bash 3.2 shipped with macOS does not support.
+The draft head is tied to the model family, not to the target's quantization, so it does not change with the target file.
+
 
 ## Cost
 
-An on-demand `g2-standard-8` costs approximately $0.81/hr and bills while the instance is RUNNING, independent of load.
+An on-demand `g2-standard-8` costs approximately $0.81/hr and bills while the instance is RUNNING, independent of load. At 31.0 tok/s that is 138,000 tokens per dollar, against 107,000 before.
 
 ```bash
-bash scripts/teardown.sh          # stop, preserving disk and model
+bash scripts/teardown.sh          # stop, preserving disk and models
 bash scripts/teardown.sh delete   # full teardown
 ```
 
@@ -221,26 +327,33 @@ Spot instances cost about $0.24/hr, but preemption terminates the instance and r
 
 ## Operational notes
 
-The deep-learning images do not provide `pip` on PATH. A startup script that downloads through `huggingface_hub` exits 127 before transferring anything, and the failure is quiet: the instance boots, the GPU is healthy and `/opt/models` is empty. This repository fetches the GGUF with an 8-way ranged `curl`, which requires only curl, completes 17.9 GB in about 100 seconds, and verifies the reassembled file against `content-length` before the server starts.
+The deep-learning images do not provide `pip` on PATH. A startup script that downloads through `huggingface_hub` exits 127 before transferring anything, and the failure is quiet: the instance boots, the GPU is healthy and `/opt/models` is empty. This repository fetches both GGUFs with ranged `curl`, which requires only curl and verifies each reassembled file against `content-length` before the server starts.
 
-On-demand L4 capacity is scarce. A typical run walks through nine or more zones returning `STOCKOUT` before one succeeds, so allow roughly 15 minutes to reach READY and let the script cycle. Each retry recreates the instance, so read the external IP from `gcloud compute instances list` once the script reports READY.
+The instance builds llama.cpp on first boot, which is the long pole at roughly 20 minutes on 8 vCPUs. It runs concurrently with the two downloads. If you provision often, build once with `scripts/build-llamacpp.sh` on a larger CPU instance and copy `bin/` to `/opt/llama.cpp/build/bin`.
 
-A stopped instance restarts with `bash scripts/start.sh`, keeping its disk and the downloaded model, but the zone does not hold capacity for it. Restarts return `STOCKOUT` exactly as creation does, and a stopped instance cannot change zones, so the script retries in place until an L4 frees up. Restarting also re-runs the startup script, which means the serving flags come from instance metadata rather than from the script that first created it; update them together, or a restart will silently revert the context size and the tuned speculative parameters.
+The server runs under systemd as `qwen-server`, not under docker, because the patched binary is built locally. `journalctl -u qwen-server` has the serving log; `/var/log/qwen-startup.log` has the provisioning log.
+
+On-demand L4 capacity is scarce. A typical run walks through nine or more zones returning `STOCKOUT` before one succeeds, so let the script cycle. Each retry recreates the instance, so read the external IP from `gcloud compute instances list` once the script reports READY.
+
+A stopped instance restarts with `bash scripts/start.sh`, keeping its disk, the models and the build, but the zone does not hold capacity for it. Restarts return `STOCKOUT` exactly as creation does, and a stopped instance cannot change zones, so the script retries in place until an L4 frees up. Serving flags come from instance metadata (`qwen-ctx`, `qwen-nmax`, `qwen-mmvq-max`), so a restart picks up whatever the metadata currently says.
 
 When `/health` never comes up, the boot log carries the reason:
 
 ```bash
-gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -50 /var/log/qwen-startup.log'
+gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -80 /var/log/qwen-startup.log'
 ```
 
 ## Files
 
 | Path | Purpose |
 | --- | --- |
-| `scripts/provision-ondemand.sh` | create the L4, fetch the model, start the server, wait for health |
+| `scripts/provision-ondemand.sh` | create the L4, then hand off to `startup.sh`, and wait for health |
+| `scripts/startup.sh` | on-instance: ECC off, build llama.cpp, fetch both models, install the systemd unit |
+| `scripts/build-llamacpp.sh` | build a patched, SM89-only llama.cpp anywhere with a CUDA toolkit |
+| `patches/0001-mmvq-runtime-crossover.patch` | adds `GGML_MMVQ_MAX`, the kernel crossover knob |
 | `scripts/bench.sh` | seven-workload decode benchmark |
-| `scripts/sweep-spec.sh` | speculative decoding parameter sweep |
-| `scripts/max-context.sh` | binary search for the largest usable context |
+| `scripts/sweep-spec.sh` | speculative decoding parameter sweep; still drives the previous docker path, so point it at `/opt/llama.cpp/build/bin/llama-server` before use |
+| `scripts/max-context.sh` | binary search for the largest usable context; same caveat |
 | `scripts/verify-quality.sh` | determinism and accuracy checks |
 | `scripts/start.sh` | restart a stopped instance, retrying through STOCKOUT |
 | `scripts/teardown.sh` | stop or delete |
@@ -251,4 +364,4 @@ gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -50 /var/l
 
 ## License
 
-The scripts in this repository are Apache-2.0. The model weights are covered by their own licence: [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the [Unsloth GGUF conversion](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) are both Apache-2.0.
+The scripts in this repository are Apache-2.0. The model weights are covered by their own licence: [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the [Unsloth GGUF conversion](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) are both Apache-2.0. The draft head comes from [ggml-org/Qwen3.8-27B-GGUF](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF), same licence.
