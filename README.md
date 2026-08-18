@@ -274,7 +274,19 @@ The obvious follow-up is whether a better voltage/frequency point exists that th
 | 1200 MHz | 31.27 tok/s | 72.10 W |
 | 1000 MHz | 29.65 tok/s | 69.07 W |
 
-Every setting from 1200 MHz up draws the full cap and returns the same throughput inside a 0.3 tok/s spread. There is no better operating point to find: the governor has already found it, and the only thing an explicit lock achieves is to make things worse once the clock drops far enough to become the binding constraint itself, which happens between 1200 and 1000 MHz.
+Every setting from 1200 MHz up returns the same throughput inside a 0.3 tok/s spread. There is no better operating point to find: the governor has already found it, and the only thing an explicit lock achieves is to make things worse once the clock drops far enough to become the binding constraint itself, which happens between 1200 and 1000 MHz.
+
+Sampling the card at 100 ms through 118 seconds of decode, rather than reading one instantaneous value, says how tight the cap is:
+
+| | |
+| --- | --- |
+| power drawn | mean 69.75 W, median 71.48, p95 73.01, against a 72 W cap |
+| samples within 1 W of the cap | 65.6% |
+| SM clock | mean 1286 MHz, p05 1080, p95 1830 |
+| memory clock | 6251 MHz, constant, never throttles |
+| GPU utilization | 92.1% |
+
+Decode sits at the cap about two thirds of the time, and the SM clock swings across a 750 MHz band absorbing it while the memory clock never moves once. That is the signature of a power limit being paid for out of the compute side of the chip: the memory system is never the thing being slowed down, the unpacking is. It also shows the governor spending part of its time below the 1200 MHz knee, which is the most plausible reason every locked setting in Table 7 edges slightly above `auto`. The effect is a consistent 0.5%, which is inside run-to-run noise, so nothing is shipped on it.
 
 So the honest statement about power on this card is narrower than "power-bound" and more useful than "bandwidth-bound". Decode is pinned at the 72 W cap; the cap is genuinely binding, because lowering it costs throughput immediately; and no software knob redistributes that budget, because the hardware governor is already spending it well. It is a hardware ceiling with no software handle on it, which is why it appears here rather than in the list of things to tune.
 
