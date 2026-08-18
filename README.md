@@ -1,6 +1,6 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 31.8 tok/s decode over a 121,600-token context on a single NVIDIA L4 24 GB, or 32.4 to 33.0 tok/s over 65,536, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.32 to 1.37x the 24.1 tok/s this repository previously served, at identical weight quantization and with no measured quality regression. The long-context figure quantizes the KV cache to q8_0, which is what buys the window; the weights are `UD-Q4_K_XL` either way.
+Qwen3.8-27B serves at 31.8 tok/s decode over a 127,488-token context on a single NVIDIA L4 24 GB, or 32.4 to 33.0 tok/s over 65,536, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.32 to 1.37x the 24.1 tok/s this repository previously served, at identical weight quantization and with no measured quality regression. The long-context figure quantizes the KV cache to q8_0, which is what buys the window; the weights are `UD-Q4_K_XL` either way.
 
 ```bash
 gcloud config set project <your-project>
@@ -163,8 +163,8 @@ Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2,
 ## Serving configuration
 
 ```
---ctx-size 121600 --parallel 1 --flash-attn on -ngl 99
--ub 512 -b 512 --cache-type-k q8_0 --cache-type-v q8_0 --no-mmap --threads 8
+--parallel 1 --flash-attn on --fit on --fit-target 768
+-ub 512 -b 2048 --cache-type-k q4_0 --cache-type-v q4_0 --no-mmap --threads 8
 --spec-type draft-mtp
 --spec-draft-model /opt/models/mtp-o2k.gguf --spec-draft-ngl 99
 --spec-draft-n-max 5 --spec-draft-n-min 5 --spec-draft-p-min 0.0
@@ -464,24 +464,55 @@ CUDA error: out of memory
 
 The seven-workload benchmark never triggers it because it replays the same seven shapes, so the number looks fine right up until real traffic arrives. It surfaced only when the 40-prompt accuracy check ran, with `enable_thinking` off and 40 distinct short prompts, and took the server down twice. The fix is headroom, not a smaller graph: 65,536 leaves 1.7 GiB, survives the same stress with zero restarts, and costs nothing measurable in throughput. Treat "fits at idle" as necessary and not sufficient, and validate a context ceiling with varied prompt shapes rather than with the benchmark.
 
-### Quantizing the KV cache moves the ceiling a long way
+### The context ceiling is a memory-planning problem, and llama.cpp already solves it
 
-The paragraph above says headroom is the fix, and it is, but headroom can be bought rather than only conceded. Only 16 of the 64 layers keep a KV cache at all; the other 48 are Gated DeltaNet and carry a fixed recurrent state that does not grow with context. Those 16 layers cost 64 KiB per token at f16, which is what makes context expensive here, and `--cache-type-k/-v q8_0` roughly halves it.
+Two things buy context here. Only 16 of the 64 layers keep a KV cache at all - the other 48 are Gated DeltaNet and carry a fixed recurrent state that does not grow - so those 16 cost 64 KiB per token at f16, and `--cache-type-k/-v` cuts that directly. But the ceiling is not set by the KV cache alone, and getting that wrong took a production server down.
 
-Re-running the ceiling search with a **shape battery** rather than a single generation - prompt lengths chosen to land on many different final-ubatch remainders, plus one filling a large fraction of the window - gives two very different answers:
+**What went wrong.** Searching for the largest context that "loads and survives a battery of prompt shapes" produced 121,600 with q8_0 KV, which passed a battery including a 46k-token fill and then died in production 31 minutes later. The failure was not the KV cache, which is allocated at load. It was a *compute graph buffer* allocated lazily inside `llama_context::decode`:
 
-**Table 14: largest context that survives the shape battery.**
+```
+llama_context::decode -> process_ubatch -> ggml_backend_sched_alloc_graph -> ggml_gallocr_alloc_graph
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 158.66 MiB on device 0: cudaMalloc failed: out of memory
+GGML_ASSERT(... ) failed
+```
 
-| KV cache | Ceiling | Peak VRAM | Decode |
-| --- | --- | --- | --- |
-| f16 | 71,680 | 23,422 MiB | 32.4 tok/s |
-| **q8_0** | **121,600** | **24,026 MiB** | **31.81 tok/s** |
+It happened at context depth 39,711 on a follow-up turn reusing a 0.956-similar prefix - **shallower than the 46k the battery had already filled**. Depth was never the variable; graph *shape* was. And because a 24 GB process takes about ten minutes to write a core file, the server did not die promptly: it hung, and the in-flight request hung with it before the eventual `SIGABRT`.
 
-The search is worth reading for how it failed. At f16, 81,920 died on a **40-word prompt** - the smallest in the battery, not the largest - which is the signature of graph instantiation rather than of a full cache, and 73,728 aborted outright at load. At q8_0, 138,240 failed to load, 129,792 and 125,696 died under the battery, and 121,600 held. A search that accepts "health plus one generation" reports none of this, because one generation is one shape.
+**The mechanism that prevents this ships with llama.cpp.** `--fit` (default on) sizes unset arguments to fit device memory, and `--fit-target` sets the margin it leaves, defaulting to 1024 MiB per device. Setting `-ngl` and `--ctx-size` explicitly disables it, and it says so on every start:
 
-So the honest cost of the long window is **1.9% of throughput for 86% more context**, at 40/40 on the arithmetic accuracy set, unchanged from f16. The weights are untouched: `UD-Q4_K_XL` is still `UD-Q4_K_XL`, and the KV cache is a different axis from the weight quantization. The sibling [Qwen3.6-35B-A3B box](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) in the same fleet already serves q4_0 KV, which by the same arithmetic would reach past the model's own 262,144 limit.
+```
+common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+```
 
-121,600 leaves about 540 MiB free at peak, which is thin. It survived the battery and a real long-context agent workload with zero allocation errors, but anyone wanting more margin than that should take 104,960, which measured clean at 23,310 MiB and leaves four times the headroom.
+That line was printed at every boot of every configuration in this file, and reading past it is what made a hand-picked context look reasonable. Leaving both unset and letting the planner choose gives an honest curve, about 26 tokens of context per MiB of margin surrendered:
+
+**Table 14: context granted by `--fit`, against the margin asked for (`-ub 512`, q8_0 KV).**
+
+| `--fit-target` | Granted ctx | VRAM after load |
+| --- | --- | --- |
+| 1024 MiB | 68,096 | 22,220 MiB |
+| 768 MiB | 75,008 | 22,484 MiB |
+| 512 MiB | 81,664 | 22,736 MiB |
+| 256 MiB | 88,320 | 22,990 MiB |
+
+Read against that, 121,600 was not a larger window than 88,320. It was the same window with the safety margin spent.
+
+**Getting the window back honestly** means making the graphs and the cache smaller rather than removing the margin. At a fixed, comfortable 768 MiB:
+
+**Table 15: context granted at a 768 MiB margin.**
+
+| `-ub` | KV | Granted ctx |
+| --- | --- | --- |
+| 512 | q8_0 | 75,008 |
+| 256 | q8_0 | 81,664 |
+| 128 | q8_0 | 84,992 |
+| **512** | **q4_0** | **127,488** |
+| 256 | q4_0 | 139,776 |
+| 128 | q4_0 | 146,176 |
+
+So q4_0 KV at the full `-ub 512` grants **127,488 with a real 768 MiB margin** - a larger window than the configuration that was crashing, and it holds. The same multi-turn deep-context stress that killed 121,600 at depth 39.7k runs to 95,126 tokens here with zero allocation errors and 1.1 GiB still free at peak. Accuracy is 40/40 at f16, q8_0 and q4_0 alike; the weights are `UD-Q4_K_XL` throughout, and the KV cache is a different axis, the one the sibling [Qwen3.6-35B-A3B box](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) already runs at q4_0.
+
+The shipped configuration therefore sets neither `-ngl` nor `--ctx-size`, and asks for the margin instead: `--fit on --fit-target 768 --cache-type-k q4_0 --cache-type-v q4_0`. Anything downstream that needs to know the window should ask `/props` rather than hold a copy, because a copy is what drifts.
 
 If the priority is instead the largest window with no KV quantization at all, drop `--spec-draft-model` and keep the kernel patch: that frees the draft head's 611 MiB, measures 28.05 tok/s and fits the original 104,192.
 
@@ -489,7 +520,7 @@ If the priority is instead the largest window with no KV quantization at all, dr
 
 `scripts/verify-quality.sh` runs two independent checks against a `--spec-type none` reference: byte-level determinism and accuracy on 40 arithmetic problems with known ground truth. It captures three configurations so the kernel change and speculation can be told apart.
 
-**Table 15: quality checks.**
+**Table 16: quality checks.**
 
 | Configuration | Accuracy | Byte-identical to reference, per task |
 | --- | --- | --- |
@@ -555,9 +586,9 @@ Administrative access runs over IAP (`gcloud compute ssh --tunnel-through-iap`),
 
 ## Quantizations
 
-Table 16 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
+Table 17 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
 
-**Table 16: quantizations and fit on a 24 GB L4.**
+**Table 17: quantizations and fit on a 24 GB L4.**
 
 | File | Size | Fit |
 | --- | --- | --- |
