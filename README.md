@@ -124,6 +124,8 @@ The second cost in the model is drafting. Qwen3.8-27B ships a native MTP block, 
 
 Read per step is the output tensor plus the 227.6 MiB MTP block; the embedding is a row lookup and is not read. All three land within 5% of what bandwidth alone predicts, so drafting is bandwidth-bound too and shrinking the head is the only lever on it.
 
+The block is the other half of the draft read, 227.6 MiB against the sub-head's 157 MiB, and it does not want to be cheaper either: rebuilding it at Q3_K with the imatrix gives 30.67 tok/s and accepted length 2.89 against Q4_0's 31.77 and 2.95, and cumulative draft time goes *up* (5143 ms against 4831) despite the smaller file, because Q3_K's dequantization kernel is slower per byte than Q4_0's. Q4_0 block with a Q2_K output tensor is the optimum on both axes.
+
 Accepted length does not fall across a 2.0x change in head size, so the whole saving is real. Q3_K sits between Q4_0 and Q2_K in size but measured worse than both, 28.89 tok/s against 29.20 and 29.91 on the same two workloads: its first-position acceptance fell to 0.746, against 0.779 for Q4_0 and 0.763 for Q2_K, which cost more than the bandwidth it saved. Q2_K is the floor that still holds acceptance.
 
 ## Why the draft chain runs in one decode
