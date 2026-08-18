@@ -607,6 +607,8 @@ gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -80 /var/l
 | `scripts/verify-quality.sh` | determinism and accuracy checks |
 | `tools/bandwidth-probe.cu` | measure achievable DRAM bandwidth; used to separate the power tax from kernel slack |
 | `tools/capture-mtp-data.cpp` | capture MTP draft-head training data at prefill speed, for the drafter project the ceiling analysis points to |
+
+`capture-mtp-data.cpp` is built and validated, not aspirational, but it comes with a constraint worth knowing before anyone plans the drafter project around it. Compiled against the installed libraries and run over 4,000 positions, it emits exact, self-consistent records: the argmax equals the top-1 id in all of them, the hidden states are fully dense at 5,120 nonzero components, and there is no ragged tail. The catch is volume. Each position stores a bf16 hidden state, so a record is **10,308 bytes**, of which the top-K logits are only 64. That is 10.3 GB per million tokens. The published recipes regenerate 12,000 to 40,000 answers, which at a few hundred tokens each is 6M to 20M tokens, or 62 to 206 GB - against 29 GB free on the 120 GB boot disk this repository provisions. Capturing at that scale therefore needs a larger disk, or capture and training fused into one process so the hidden states are consumed and discarded, or the hidden state stored at lower precision than bf16. Sizing this in advance is cheaper than discovering it 40 GB into a run.
 | `scripts/start.sh` | restart a stopped instance, retrying through STOCKOUT |
 | `scripts/teardown.sh` | stop or delete |
 
