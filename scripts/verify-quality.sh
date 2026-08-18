@@ -13,10 +13,11 @@
 # Run ON the instance:  bash ~/verify-quality.sh
 # Env: BIN (dir holding bin/llama-server), MODEL, DRAFT, CTX
 set -u
-BIN="${BIN:-$HOME/lcpp}"
+BIN="${BIN:-/opt/llama.cpp/build}"
 MODEL="${MODEL:-/opt/models/model.gguf}"
 DRAFT="${DRAFT:-/opt/models/mtp-o2k.gguf}"
 CTX="${CTX:-8192}"
+CHAIN="GGML_MMVQ_MAX=2,GGML_MMVQ_MAX_Q6K=8,GGML_MMVQ_MAX_IQ4XS=8,LLAMA_SPEC_CHAIN=1,LLAMA_SPEC_CHAIN_SUB=98304,LLAMA_SCHED_POOL=8"
 
 cat > /tmp/_det.py <<'PY'
 import json,urllib.request,sys
@@ -96,16 +97,16 @@ echo "-- accuracy (reference)"
 python3 /tmp/_acc.py
 
 echo
-echo "== MMQ crossover only (GGML_MMVQ_MAX=2), no speculation =="
-start GGML_MMVQ_MAX=2 --spec-type none
+echo "== kernel routing only, no speculation =="
+start "$CHAIN" --spec-type none
 python3 /tmp/_det.py /tmp/out_mmq.json
 echo "-- accuracy"
 python3 /tmp/_acc.py
 
 echo
-echo "== shipped tuned config: MMQ crossover + MTP sidecar n=5 =="
-start GGML_MMVQ_MAX=2 --spec-type draft-mtp --spec-draft-model "$DRAFT" \
-  --spec-draft-ngl 99 --spec-draft-n-max 5 --spec-draft-n-min 5 --spec-draft-p-min 0.0
+echo "== shipped config: kernel routing + chain drafting + MTP sidecar n=5 =="
+start "$CHAIN" --spec-type draft-mtp --spec-draft-model "$DRAFT" \
+  --spec-draft-ngl 99 --spec-draft-n-max 5 --spec-draft-n-min 5 --spec-draft-p-min 0.0 -bs
 python3 /tmp/_det.py /tmp/out_opt.json
 echo "-- accuracy"
 python3 /tmp/_acc.py

@@ -296,12 +296,12 @@ If the full 104,192 matters more than the last 9%, drop `--spec-draft-model` and
 | Configuration | Accuracy | Byte-identical to reference, per task |
 | --- | --- | --- |
 | No speculation, stock kernel selection (reference) | 40/40 | reference; identical to itself across two runs |
-| No speculation, `GGML_MMVQ_MAX=2` | 40/40 | 3 of 5 |
-| Shipped configuration | 40/40 | 3 of 5 |
+| No speculation, shipped kernel routing | 40/40 | 4 of 5 |
+| Shipped configuration | 40/40 | 1 of 5 |
 
 Accuracy is unchanged. Byte-level output is not, and neither divergence is a regression.
 
-Speculative decoding is lossless by construction, since a drafted token is emitted only after the target verifies it, but accepting a drafted token changes the batch shape of the forward pass and therefore the order of floating-point reduction, which flips tokens that were near ties. The middle row isolates the same effect for the kernel change alone, with speculation held out: `mul_mat_q` and `mul_mat_vec_q` accumulate the same products in a different order, so two of the five prompts diverge on a near-tie token. Running any one configuration twice is byte-identical, so the server itself is deterministic and the divergence is a property of the reduction order, not of run-to-run noise.
+Speculative decoding is lossless by construction, since a drafted token is emitted only after the target verifies it, but accepting a drafted token changes the batch shape of the forward pass and therefore the order of floating-point reduction, which flips tokens that were near ties. The middle row isolates the same effect for the kernel change alone, with speculation held out. Note that at batch 1 both configurations use `mul_mat_vec_q` regardless of the crossover, so the one prompt that diverges there does so through *prompt processing*: the prompt is wide enough to cross the boundary, the two kernels accumulate the same products in a different order, and the resulting KV cache differs in the last bits and carries into generation. Running any one configuration twice is byte-identical, so the server itself is deterministic and the divergence is a property of the reduction order, not of run-to-run noise.
 
 If you need bit-exact reproducibility against a previously captured reference, run `--spec-type none` without `GGML_MMVQ_MAX` at roughly 15 tok/s.
 
