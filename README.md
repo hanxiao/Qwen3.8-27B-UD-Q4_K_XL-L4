@@ -239,6 +239,47 @@ The last column is the honest efficiency metric: how much a stack spends above t
 
 That last number is the useful one. **100 tok/s for this model at this quantization is reachable, and this software reaches it — it needs about 913 GB/s of memory bandwidth to do so.** A 3090 (936), a 4090 (1008) or an L40S (864, ~95 tok/s) are in that class. An L4 at 300 GB/s is not, and no amount of software closes a 3x hardware gap. The work in this repository is portable to those cards unchanged; the patch, the draft head and the flags are all bandwidth-agnostic.
 
+## The 72 W wall
+
+The L4 is a single-slot card with no auxiliary power connector, so it lives inside the PCIe slot budget. `nvidia-smi` reports min 40 W, default 72 W, **max 72 W**: the cap cannot be raised, only lowered. That turns out to matter more than it looks, and it is a second wall standing independently of the drafter.
+
+Sweeping the cap while leaving clocks on auto:
+
+**Table 6: decode throughput against the power cap.**
+
+| Power cap | Decode | SM clock |
+| --- | --- | --- |
+| 45 W | 12.02 tok/s | 315 MHz |
+| 55 W | 19.69 tok/s | 495 MHz |
+| 65 W | 27.46 tok/s | 870 MHz |
+| 72 W (stock) | 30.86 tok/s | 1455 MHz |
+
+Throughput tracks the cap closely, and the first three steps are nearly straight: +7.67, +7.77, then +3.40 over a 7 W step rather than 10 W. The curve is bending at the top but has not flattened.
+
+The comparison that gives this meaning is the streaming probe in `tools/bandwidth-probe.cu`, which does nothing but read memory. It reaches 293.4 GB/s at a 50 W cap and gains nothing from the remaining 22 W: 293.4 / 293.5 / 293.6 GB/s at 50 / 60 / 72 W. **Pure memory streaming on this card is done at 50 W. Quantized decode uses every watt of 72.** The difference is dequantization: unpacking Q5_K and IQ4_XS blocks into something the tensor cores can multiply is ALU work, it is on the critical path of every byte read, and it is what consumes the other 22 W.
+
+That is also the mechanism behind a number reported earlier in this file, the gap between the 293.4 GB/s the card can stream and the 252.8 GB/s llama.cpp actually achieves during decode. It is not kernel sloppiness. The memory clock never moves; the SM clock throttles. Decode is buying its bandwidth with a power budget it is simultaneously spending on unpacking.
+
+The obvious follow-up is whether a better voltage/frequency point exists that the governor is not choosing, since a lower clock runs at a lower voltage and power goes as roughly f·V². Locking the graphics clock at a fixed 72 W cap:
+
+**Table 7: decode throughput against locked SM clock, cap fixed at 72 W.**
+
+| SM clock | Decode | Power drawn |
+| --- | --- | --- |
+| auto | 31.14 tok/s | 72.05 W |
+| 2040 MHz | 31.41 tok/s | 70.96 W |
+| 1800 MHz | 31.22 tok/s | 72.50 W |
+| 1600 MHz | 31.29 tok/s | 72.35 W |
+| 1400 MHz | 31.35 tok/s | 72.21 W |
+| 1200 MHz | 31.27 tok/s | 72.10 W |
+| 1000 MHz | 29.65 tok/s | 69.07 W |
+
+Every setting from 1200 MHz up draws the full cap and returns the same throughput inside a 0.3 tok/s spread. There is no better operating point to find: the governor has already found it, and the only thing an explicit lock achieves is to make things worse once the clock drops far enough to become the binding constraint itself, which happens between 1200 and 1000 MHz.
+
+So the honest statement about power on this card is narrower than "power-bound" and more useful than "bandwidth-bound". Decode is pinned at the 72 W cap; the cap is genuinely binding, because lowering it costs throughput immediately; and no software knob redistributes that budget, because the hardware governor is already spending it well. It is a hardware ceiling with no software handle on it, which is why it appears here rather than in the list of things to tune.
+
+It also sharpens the comparison with the RTX 3090 in the section above. That card has 3.12x the memory bandwidth of an L4 and 4.9x the power budget, 350 W against 72 W. For an FP16 model the bandwidth ratio would be the whole story. For a K-quantized model, where every byte read must also be unpacked, the power ratio is part of it too, and the L4 is the more starved of the two on that axis.
+
 ## Can this reach 100 tok/s
 
 No, and the arithmetic is worth writing down because it bounds the whole problem rather than this particular implementation.
@@ -275,7 +316,7 @@ Measured and rejected, so they need not be tried again.
 | `DimInfer/Qwen3.8-27B-Dspark-v1`, block-15 DSpark head | 23.96 tok/s over seven workloads, a tie with MTP. Its accepted length is better but it runs two draft-model forwards per cycle, one of which routes target hidden states through host memory, and that erases the gain on a card this compute-poor. |
 | `RadixArk` / `erlidev` block-7 DSpark heads | 18.6 to 23.1 tok/s, worse. Per-position acceptance 0.81, 0.39, 0.18. |
 | n-gram and suffix drafting (`ngram-mod`, `ngram-simple`, `ngram-map-k`) | Never fires. Over a 256-token generation from a short prompt it produced 0 to 7 draft tokens total. There is no repeated history to mine at this generation length. |
-| Locking SM clocks (900, 1200, 1500, 2040 MHz) | Within 2%. Decode is bandwidth-bound, and at 900 MHz the card draws 63.6 W against a 72 W cap, so it is not power-bound either. |
+| Locking SM clocks | Nothing, across the whole usable range. At a fixed 72 W cap, auto / 2040 / 1800 / 1600 / 1400 / 1200 MHz give 31.14 / 31.41 / 31.22 / 31.29 / 31.35 / 31.27 tok/s, and only 1000 MHz finally breaks the tie downward at 29.65. An earlier version of this row concluded from the low-clock end that decode is not power-bound. That was wrong, and the section below has the corrected reading: the card is pinned at the cap at every clock above 1200 MHz, but no clock setting spends that budget better than the governor does. |
 | `-ub` 64 to 512, `-b`, `--threads` 4 to 8, `--flash-attn off`, `--no-op-offload` | All within 0.7% at batch 1. Re-swept on the tuned configuration, `-ub` 16 / 32 / 64 / 128 / 256 gave 29.92 / 28.70 / 29.87 / 29.15 / 29.16, a 1.2 tok/s spread with no trend. `-ub 512` is kept because it helps prefill, which decode does not care about. |
 | `GGML_CUDA_GRAPH_OPT=1` | 29.33 against 29.36. Its fusion pattern requires a three-way fan-out at batch 1, which only 16 of this model's 64 blocks have. |
 | `GGML_CUDA_DISABLE_FUSION=1` (control) | 28.45 against 29.36, so the existing fusions are worth about 3% and should be left on. |
