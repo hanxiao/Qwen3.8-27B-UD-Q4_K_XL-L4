@@ -136,7 +136,11 @@ The slice width matters, and its default does not suit this model. `LLAMA_SPEC_C
 | 114688 | 46% | 5136 ms | 2.91 | 31.03 |
 | 0, full head in one decode | 100% | 3723 ms | 2.90 | 29.69 |
 
-98,304 is the point where accepted length has fully recovered and the head is still only 40% of full width. Above it accepted length stops improving and the extra bytes cost throughput; below it acceptance erodes faster than the bandwidth saves. Measured on prose, code and json; the tok/s column is a three-workload subset and so is not directly comparable to Table 4.
+98,304 is the point where accepted length has fully recovered and the head is still only 40% of full width.
+
+Measuring the id distribution of the model's own output explains why, and closes off the obvious next idea. Over 1,792 generated tokens, the fraction falling below an id threshold is 73.6% at 8,192, 88.2% at 32,768, **97.1% at 98,304** and 97.5% at 131,072. The curve has its knee exactly where the sweep put the optimum: below 98,304 acceptance erodes fast, above it there is almost nothing left to buy.
+
+The idea this suggests is FR-Spec: rank the vocabulary by frequency rather than by id, and cover the same 97% in far fewer rows. Measured, it is worse. Ranking tokens by frequency in a neutral corpus (589,184 tokens of public prose and source, 22,734 distinct) and scoring that ranking on held-out generations covers 78.4% at 32,768 rows against id-ordering's 88.2%, and plateaus at 78.4% no matter how many rows are added, because the corpus simply never contains the tail the model uses. Qwen's BPE ids are already ordered by merge frequency, so id-ordering is a frequency ranking built from the tokenizer's own training set, which is far larger than any calibration corpus. Slicing the first N rows is not a crude approximation of FR-Spec here; it is the better version of it. Above it accepted length stops improving and the extra bytes cost throughput; below it acceptance erodes faster than the bandwidth saves. Measured on prose, code and json; the tok/s column is a three-workload subset and so is not directly comparable to Table 4.
 
 Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2, 29.9, 29.4 and 27.5.
 
