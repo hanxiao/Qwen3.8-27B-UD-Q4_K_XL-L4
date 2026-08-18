@@ -1,17 +1,17 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 32.9 tok/s decode over a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.36x the 24.1 tok/s this repository previously served, at identical quantization and with no measured quality regression.
+Qwen3.8-27B serves at 32.4 to 33.0 tok/s decode over a 65,536-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.34 to 1.37x the 24.1 tok/s this repository previously served, at identical quantization and with no measured quality regression.
 
 ```bash
 gcloud config set project <your-project>
 bash scripts/provision-ondemand.sh
 ```
 
-That command creates the instance, fetches the model and the draft head, builds a patched llama.cpp, starts an OpenAI-compatible server and blocks until it answers on `/health`. Every number below was measured on the machine it provisions, on 2026-08-18.
+That command creates the instance, fetches the model and the draft head, builds a patched llama.cpp, starts an OpenAI-compatible server and blocks until it answers on `/health`. Every number below was measured on the machine it provisions, on 2026-08-17 and 2026-08-18.
 
 ## Summary of the change
 
-Three things moved throughput, in descending order of size. None of them changes the weights, the quantization, or the sampling: speculative decoding emits a drafted token only after the target model verifies it, and the kernel change swaps which CUDA kernel evaluates the same matmul. Both can reorder floating-point reductions and so flip tokens that were near ties; measured accuracy is unchanged, and the Quality section reports the checks.
+Six changes moved throughput, in descending order of size. None of them changes the weights, the quantization, or the sampling: speculative decoding emits a drafted token only after the target model verifies it, and the kernel change swaps which CUDA kernel evaluates the same matmul. Both can reorder floating-point reductions and so flip tokens that were near ties; measured accuracy is unchanged, and the Quality section reports the checks.
 
 | Change | Decode (tok/s) | Delta |
 | --- | --- | --- |
@@ -92,7 +92,7 @@ This is now the largest single removable cost in the cycle, and nothing in llama
 
 The fee is not uniform across quant types, which is worth a little. `GGML_MMVQ_MAX` in the patch takes per-type overrides, and sweeping each of this file's four types independently at draft depth 5 gives:
 
-**Table 2b: routing one quant type back to MMVQ, everything else on MMQ.**
+**Table 3: routing one quant type back to MMVQ, everything else on MMQ.**
 
 | Routed to MMVQ | Share of weights | Decode (tok/s) |
 | --- | --- | --- |
@@ -116,7 +116,7 @@ The second cost in the model is drafting. Qwen3.8-27B ships a native MTP block, 
 
 `ggml-org/Qwen3.8-27B-GGUF` publishes the MTP block as a standalone sidecar carrying its own embedding and output tensors at Q4_0. Pointing `--spec-draft-model` at it replaces the Q6_K head with a Q4_0 one. Retyping that file's output tensor to Q2_K with `llama-quantize --output-tensor-type q2_K` shrinks it further. Draft precision is not output precision: the target verifies every token, so a coarser draft head can only change how often a draft is accepted, never what is emitted.
 
-**Table 3: cost of one draft step.**
+**Table 4: cost of one draft step.**
 
 | Draft head | Output tensor | Read per step | Predicted at 252.8 GB/s | Measured | Mean accepted length, n-max 5 |
 | --- | --- | --- | --- | --- | --- |
@@ -136,9 +136,9 @@ llama.cpp drafts autoregressively: one `llama_decode` per drafted token, each fo
 
 [PR #27173](https://github.com/ggml-org/llama.cpp/pull/27173) rebuilds that as a single decode that produces the whole chain and picks each token on the GPU, emitting two floats per step instead of a logit row. It also runs the draft against a leading slice of the output tensor rather than the whole thing, on the observation that BPE ids correlate with frequency, so a draft rarely picks a high id. The target still verifies against the full vocabulary, so this narrows what gets drafted and never what gets committed.
 
-The slice width matters, and its default does not suit this model. `LLAMA_SPEC_CHAIN_SUB` defaults to 32768, which is 21% of the 151k vocabulary the PR was tuned against but only 13% of this model's 248,320. At that width mean accepted length falls from 2.89 to 2.64 and the whole gain is given back. Table 4b is the sweep.
+The slice width matters, and its default does not suit this model. `LLAMA_SPEC_CHAIN_SUB` defaults to 32768, which is 21% of the 151k vocabulary the PR was tuned against but only 13% of this model's 248,320. At that width mean accepted length falls from 2.89 to 2.64 and the whole gain is given back. Table 5 is the sweep.
 
-**Table 4b: draft sub-head width, at draft depth 5.**
+**Table 5: draft sub-head width, at draft depth 5.**
 
 | `LLAMA_SPEC_CHAIN_SUB` | Share of vocab | Cumulative draft time | Mean accepted length | Decode (tok/s) |
 | --- | --- | --- | --- | --- |
@@ -154,7 +154,7 @@ The slice width matters, and its default does not suit this model. `LLAMA_SPEC_C
 
 Measuring the id distribution of the model's own output explains why, and closes off the obvious next idea. Over 1,792 generated tokens, the fraction falling below an id threshold is 73.6% at 8,192, 88.2% at 32,768, **97.1% at 98,304** and 97.5% at 131,072. The curve has its knee exactly where the sweep put the optimum: below 98,304 acceptance erodes fast, above it there is almost nothing left to buy.
 
-The idea this suggests is FR-Spec: rank the vocabulary by frequency rather than by id, and cover the same 97% in far fewer rows. Measured, it is worse. Ranking tokens by frequency in a neutral corpus (589,184 tokens of public prose and source, 22,734 distinct) and scoring that ranking on held-out generations covers 78.4% at 32,768 rows against id-ordering's 88.2%, and plateaus at 78.4% no matter how many rows are added, because the corpus simply never contains the tail the model uses. Qwen's BPE ids are already ordered by merge frequency, so id-ordering is a frequency ranking built from the tokenizer's own training set, which is far larger than any calibration corpus. Slicing the first N rows is not a crude approximation of FR-Spec here; it is the better version of it. Above it accepted length stops improving and the extra bytes cost throughput; below it acceptance erodes faster than the bandwidth saves. Measured on prose, code and json; the tok/s column is a three-workload subset and so is not directly comparable to Table 4.
+The idea this suggests is FR-Spec: rank the vocabulary by frequency rather than by id, and cover the same 97% in far fewer rows. Measured, it is worse. Ranking tokens by frequency in a neutral corpus (589,184 tokens of public prose and source, 22,734 distinct) and scoring that ranking on held-out generations covers 78.4% at 32,768 rows against id-ordering's 88.2%, and plateaus at 78.4% no matter how many rows are added, because the corpus simply never contains the tail the model uses. Qwen's BPE ids are already ordered by merge frequency, so id-ordering is a frequency ranking built from the tokenizer's own training set, which is far larger than any calibration corpus. Slicing the first N rows is not a crude approximation of FR-Spec here; it is the better version of it. Above it accepted length stops improving and the extra bytes cost throughput; below it acceptance erodes faster than the bandwidth saves. Measured on prose, code and json; the tok/s column is a three-workload subset and so is not directly comparable to Table 6.
 
 Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2, 29.9, 29.4 and 27.5.
 
@@ -201,9 +201,9 @@ The instance also serves a web UI on port 8080, Prometheus metrics at `/metrics`
 
 ## Performance
 
-Table 4 reports decode throughput from `scripts/bench.sh`. The metric is `timings.predicted_per_second`, which excludes prompt processing, measured with `cache_prompt` disabled, greedy sampling, 256 max tokens, averaged over two runs per workload. Mean accepted length is tokens emitted per target forward pass, which is the quantity the cost model is written in.
+Table 6 reports decode throughput from `scripts/bench.sh`. The metric is `timings.predicted_per_second`, which excludes prompt processing, measured with `cache_prompt` disabled, greedy sampling, 256 max tokens, averaged over two runs per workload. Mean accepted length is tokens emitted per target forward pass, which is the quantity the cost model is written in.
 
-**Table 4: decode throughput and mean accepted length by workload.**
+**Table 6: decode throughput and mean accepted length by workload.**
 
 | Workload | Previous (tok/s) | Tuned (tok/s) | Speedup | Tuned mean accepted length |
 | --- | --- | --- | --- | --- |
@@ -222,7 +222,7 @@ Structured reasoning speculates best and open-ended chat worst, which is the usu
 
 Generation length changes the answer, and in a way worth stating explicitly because it is the difference between this benchmark and most published figures. Acceptance is worst in the first tokens after a prompt and climbs as the model settles into an answer, so a 256-token cap measures the least favourable part of every generation. Raising only the cap, changing nothing else:
 
-**Table 4c: the same configuration at a higher token cap.**
+**Table 7: the same configuration at a higher token cap.**
 
 | Workload | 256 max tokens | 1024 max tokens | Acceptance at 1024 |
 | --- | --- | --- | --- |
@@ -237,7 +237,7 @@ Generation length changes the answer, and in a way worth stating explicitly beca
 
 The average moves 5.4%, but the spread roughly doubles, and two workloads get *worse*: `chat` and `multi-turn` run past their natural answer into open-ended continuation, which speculates badly, while `summarization` stays inside the source text and reaches 0.672 acceptance and 46.51 tok/s. Three workloads (`prose`, `math`, and `summarization` at 2048) stop on their own before the cap, so their rows compare a truncated answer against a complete one rather than two lengths of the same text.
 
-The headline number in Table 4 stays the 256-token one. It is the harder measurement and the one this repository has always reported, and moving to a friendlier cap to claim a larger number would make the figure incomparable with its own history. It is worth knowing that sustained generation on this configuration runs nearer 34, and that a summarization-shaped workload runs nearer 46.
+The headline number in Table 6 stays the 256-token one. It is the harder measurement and the one this repository has always reported, and moving to a friendlier cap to claim a larger number would make the figure incomparable with its own history. It is worth knowing that sustained generation on this configuration runs nearer 34, and that a summarization-shaped workload runs nearer 46.
 
 Throughput is flat against context. At 32,768 / 65,536 / 81,920 the same configuration measures 29.63 / 29.51 / 29.60 tok/s on a two-workload subset, and the full benchmark gives 30.97 at 65,536 against 30.98 at 81,920. Context is a memory question, not a speed one, which is why the shipped default is the one that leaves headroom rather than the one that fits.
 
@@ -304,7 +304,7 @@ The L4 is a single-slot card with no auxiliary power connector, so it lives insi
 
 Sweeping the cap while leaving clocks on auto:
 
-**Table 6: decode throughput against the power cap.**
+**Table 9: decode throughput against the power cap.**
 
 | Power cap | Decode | SM clock |
 | --- | --- | --- |
@@ -321,7 +321,7 @@ That is also the mechanism behind a number reported earlier in this file, the ga
 
 The obvious follow-up is whether a better voltage/frequency point exists that the governor is not choosing, since a lower clock runs at a lower voltage and power goes as roughly f·V². Locking the graphics clock at a fixed 72 W cap:
 
-**Table 7: decode throughput against locked SM clock, cap fixed at 72 W.**
+**Table 10: decode throughput against locked SM clock, cap fixed at 72 W.**
 
 | SM clock | Decode | Power drawn |
 | --- | --- | --- |
@@ -345,7 +345,7 @@ Sampling the card at 100 ms through 118 seconds of decode, rather than reading o
 | memory clock | 6251 MHz, constant, never throttles |
 | GPU utilization | 92.1% |
 
-Decode sits at the cap about two thirds of the time, and the SM clock swings across a 750 MHz band absorbing it while the memory clock never moves once. That is the signature of a power limit being paid for out of the compute side of the chip: the memory system is never the thing being slowed down, the unpacking is. It also shows the governor spending part of its time below the 1200 MHz knee, which is the most plausible reason every locked setting in Table 7 edges slightly above `auto`. The effect is a consistent 0.5%, which is inside run-to-run noise, so nothing is shipped on it.
+Decode sits at the cap about two thirds of the time, and the SM clock swings across a 750 MHz band absorbing it while the memory clock never moves once. That is the signature of a power limit being paid for out of the compute side of the chip: the memory system is never the thing being slowed down, the unpacking is. It also shows the governor spending part of its time below the 1200 MHz knee, which is the most plausible reason every locked setting in Table 10 edges slightly above `auto`. The effect is a consistent 0.5%, which is inside run-to-run noise, so nothing is shipped on it.
 
 So the honest statement about power on this card is narrower than "power-bound" and more useful than "bandwidth-bound". Decode is pinned at the 72 W cap; the cap is genuinely binding, because lowering it costs throughput immediately; and no software knob redistributes that budget, because the hardware governor is already spending it well. It is a hardware ceiling with no software handle on it, which is why it appears here rather than in the list of things to tune.
 
@@ -355,11 +355,11 @@ It also sharpens the comparison with the RTX 3090 in the section above. That car
 
 No, and the arithmetic is worth writing down because it bounds the whole problem rather than this particular implementation.
 
-100 tok/s is 10 ms per token. One target forward pass reads 15.75 GiB of weights, and that read is unavoidable: the model is dense, every byte is touched once per pass, and there is no reuse to exploit. At the 252.8 GB/s llama.cpp currently achieves that pass costs 66.9 ms, so a pass must emit 6.7 tokens. Give it the full 293.4 GB/s the card is measured to deliver and the pass costs 57.6 ms, so it must still emit **5.8 tokens** — and that is before charging anything for drafting or for the extra width of the verification batch.
+100 tok/s is 10 ms per token. One target forward pass reads 15.75 GiB of weights, and that read is unavoidable: the model is dense, every byte is touched once per pass, and there is no reuse to exploit. At the 252.8 GB/s decode achieves, that pass costs 66.9 ms, so a pass must emit **6.7 tokens** — and that is before charging anything for drafting or for the extra width of the verification batch. The power section above explains why 252.8, rather than the 293.4 GB/s the card can stream, is the right figure to divide by, and why that gap is a hardware tax rather than kernel slack.
 
-Mean accepted length is therefore the entire problem, and Table 5 says where it actually is.
+Mean accepted length is therefore the entire problem, and Table 11 says where it actually is.
 
-**Table 5: mean accepted length, measured and published.**
+**Table 11: mean accepted length, measured and published.**
 
 | Drafter | Mean accepted length | Source |
 | --- | --- | --- |
@@ -376,13 +376,13 @@ One consequence of the power section above deserves stating here, because it mov
 
 Rebuilding the near bound on that basis: a perfect K-quant kernel would remove the 9 ms MMQ admission fee and shrink verification width, but it cannot remove the weight read or drafting. 66.9 ms of weight read, about 4 ms of irreducible width for six verified tokens, and 8.3 ms of drafting is a 79.2 ms cycle, which at the shipped accepted length of 3.01 is **38.0 tok/s**. That is the honest target for kernel work alone on this card, and it lands below 40. Passing 40 needs accepted length above roughly 3.2 as well, and passing 100 needs it near 6.6.
 
-Three idealized bounds make the headroom concrete. Give drafting away for free and keep the measured verification cost: 3.21 / 100.1 ms is 32.1 tok/s. Give away drafting *and* all verification width, so every pass costs the bare 66.9 ms weight read: 3.21 / 66.9 ms is 48.0 tok/s. Give away the 16% of bandwidth the kernels do not use as well, so the pass costs 57.6 ms: 3.21 / 57.6 ms is 55.7 tok/s. The configuration here reaches 32.9, which is past the first bound. The remaining distance to 100 tok/s is not implementation slack. It is the drafter.
+The configuration here reaches 32.4 to 33.0 tok/s, which is past the first of those bounds. The remaining distance is not implementation slack; it is the drafter.
 
-The same arithmetic answers a nearer question, 40 tok/s, which is worth writing down because it is close enough to argue about. At the shipped accepted length of 3.01, 40 tok/s means a 75.2 ms cycle. The current cycle is 92.4 ms: 66.9 ms of weight read, about 9 ms of MMQ admission cost, 7.9 ms of verification width, and 8.3 ms of drafting. Removing the MMQ penalty alone gives 36.2. Removing it and halving drafting gives 38.3. Reaching 40 requires essentially all of the kernel overhead to go, or accepted length to rise from 3.01 to about 3.7. Both are real projects: the first is a Marlin-class kernel for K-quants at M=6, the second is a trained draft head. Neither is a flag.
+The same arithmetic answers a nearer question, 40 tok/s, which is worth writing down because it is close enough to argue about. At the shipped accepted length of 3.01, 40 tok/s means a 75.2 ms cycle. The current cycle is 92.1 ms: 66.9 ms of weight read, about 9 ms of MMQ admission cost, 7.9 ms of verification width, and 8.3 ms of drafting. Removing the MMQ penalty alone gives 36.2. Removing it and halving drafting gives 38.3. Reaching 40 requires essentially all of the kernel overhead to go, or accepted length to rise from 3.01 to about 3.7. Both are real projects: the first is a Marlin-class kernel for K-quants at M=6, the second is a trained draft head. Neither is a flag.
 
 One more form of the question is worth settling, because "not with this drafter" invites "then with which drafter?". Sweep the draft depth and ask what accepted length each depth would need, against the ceiling that depth itself imposes, since accepted length can never exceed depth + 1:
 
-**Table 5b: what 100 tok/s would require at each draft depth.**
+**Table 12: what 100 tok/s would require at each draft depth.**
 
 | Draft depth | Verify width | Cycle | Accepted length needed for 100 tok/s | Ceiling (depth + 1) |
 | --- | --- | --- | --- | --- |
@@ -418,7 +418,7 @@ Measured and rejected, so they need not be tried again.
 | `RadixArk` / `erlidev` block-7 DSpark heads | 18.6 to 23.1 tok/s, worse. Per-position acceptance 0.81, 0.39, 0.18. |
 | n-gram and suffix drafting (`ngram-mod`, `ngram-simple`, `ngram-map-k`) | Never fires. Over a 256-token generation from a short prompt it produced 0 to 7 draft tokens total. There is no repeated history to mine at this generation length. |
 | Bypassing L1 for global loads (`-Xptxas -dlcm=cg`) | Worse, and the reason matters more than the result. Decode reads 15.75 GiB of weights with no reuse whatsoever, so every L1 tag lookup and fill on that stream is spent for nothing, and on a card pinned at its power cap that waste should be worth reclaiming. Built with the flag and alternated against the deployed binary twice: 30.72 and 30.77 tok/s against 31.38 and 31.12, a consistent 1.6% loss. The flag is indiscriminate, and the loads it also bypasses are the ones that *do* have reuse: the q8_1-quantized activation tile is read by every block in the grid. A surgical version, `__ldcg` on the weight tiles only, would avoid that, but the measurement above argues it would not pay either, because the gap it is aimed at is not a cache-efficiency gap. |
-| DFlash drafting (`--spec-type draft-dflash`) | Ruled out on the publishers' own numbers. The flag is in the binary and DFlash is widely described as beating MTP, so it is the obvious next thing to try, but all three Qwen3.8-27B drafters published for it report acceptance below this MTP head's 3.01. `mrchuy/Qwen3.8-27B-DFlash-drafter-bootstrap-GGUF` is Qwen3.6 weights transplanted onto the Qwen3.8 tokenizer and reaches 2.02 tokens per verification, acceptance 0.572 / 0.297 / 0.152; its author's own A/B on one target and one machine is 31.94 tok/s for DFlash against 50.70 for native MTP. `kstoyanov99/Qwen3.8-27B-Dflash` is genuinely SpecForge-trained on Qwen3.8 and measures 1.81 accepted tokens per step at 51.27% first-position acceptance. `rwmacy/qwen3.8-27b-dflash-drafter-fp8-b70` claims a mean acceptance length of 2.5 to 3.5, but it ships FP8 safetensors rather than GGUF, it was fine-tuned partly on the benchmark domain it reports, and it requires a forked vLLM carrying an off-by-one fix in the DFlash readout without which acceptance collapses to about 24%. A 1.4-1.7 GiB drafter also costs far more per step on this card than the 0.611 GiB head in Table 3. Related: llama.cpp [issue #24541](https://github.com/ggml-org/llama.cpp/issues/24541) reports EAGLE3 against a `qwen3_5` hybrid target running slower than MTP despite acceptable acceptance. |
+| DFlash drafting (`--spec-type draft-dflash`) | Ruled out on the publishers' own numbers. The flag is in the binary and DFlash is widely described as beating MTP, so it is the obvious next thing to try, but all three Qwen3.8-27B drafters published for it report acceptance below this MTP head's 3.01. `mrchuy/Qwen3.8-27B-DFlash-drafter-bootstrap-GGUF` is Qwen3.6 weights transplanted onto the Qwen3.8 tokenizer and reaches 2.02 tokens per verification, acceptance 0.572 / 0.297 / 0.152; its author's own A/B on one target and one machine is 31.94 tok/s for DFlash against 50.70 for native MTP. `kstoyanov99/Qwen3.8-27B-Dflash` is genuinely SpecForge-trained on Qwen3.8 and measures 1.81 accepted tokens per step at 51.27% first-position acceptance. `rwmacy/qwen3.8-27b-dflash-drafter-fp8-b70` claims a mean acceptance length of 2.5 to 3.5, but it ships FP8 safetensors rather than GGUF, it was fine-tuned partly on the benchmark domain it reports, and it requires a forked vLLM carrying an off-by-one fix in the DFlash readout without which acceptance collapses to about 24%. A 1.4-1.7 GiB drafter also costs far more per step on this card than the 0.611 GiB head in Table 4. Related: llama.cpp [issue #24541](https://github.com/ggml-org/llama.cpp/issues/24541) reports EAGLE3 against a `qwen3_5` hybrid target running slower than MTP despite acceptable acceptance. |
 | Raising MMVQ's warp count at verification width | Worse, and it closes the last cheap route to the MMQ admission fee. The L4 resolves to `MMVQ_PARAMETERS_GENERIC`, whose `calc_nwarps` drops from 4 warps to 2 at `ncols_dst >= 5` while the grid stays fixed by output rows, so verification at width 6 runs at half the warps of width 4. On Ada the 16-blocks-per-SM limit pins 2 warps at 66.7% occupancy where 4 warps reach 100%, which is the shape of a fix for a bandwidth-bound kernel. Built both from one commit and measured on prose, code and json: MMVQ at 2 warps gives 21.02 tok/s and at 4 warps 19.46, against MMQ's 31.38. The occupancy gain is real and is beaten by what it costs, because at 4 warps the K loop wastes more of its last trip (68 of 96 block-slots on the K=17408 matrices against 68 of 80 at 2 warps). The useful part of the result is the margin: MMVQ is 10 tok/s behind MMQ at this width, so no warp-count tuning reaches it and the admission fee needs a different kernel, not a better-configured one. |
 | Locking SM clocks | Nothing, across the whole usable range. At a fixed 72 W cap, auto / 2040 / 1800 / 1600 / 1400 / 1200 MHz give 31.14 / 31.41 / 31.22 / 31.29 / 31.35 / 31.27 tok/s, and only 1000 MHz finally breaks the tie downward at 29.65. An earlier version of this row concluded from the low-clock end that decode is not power-bound. That was wrong, and the section below has the corrected reading: the card is pinned at the cap at every clock above 1200 MHz, but no clock setting spends that budget better than the governor does. |
 | `-ub` 64 to 512, `-b`, `--threads` 4 to 8, `--flash-attn off`, `--no-op-offload` | All within 0.7% at batch 1. Re-swept on the tuned configuration, `-ub` 16 / 32 / 64 / 128 / 256 gave 29.92 / 28.70 / 29.87 / 29.15 / 29.16, a 1.2 tok/s spread with no trend. `-ub 512` is kept because it helps prefill, which decode does not care about. |
@@ -429,23 +429,20 @@ Measured and rejected, so they need not be tried again.
 | Raising `--spec-draft-p-min` with the cheap head | Monotonically worse: 28.71 at 0.0 down to 25.13 at 0.6. |
 | PR [#26705](https://github.com/ggml-org/llama.cpp/pull/26705), branchless Q4_K/Q5_K scale unpack | Nothing, and it cannot help here. It removes a per-column re-execution of the scale unpack inside `mul_mat_vec_q`, but this configuration routes verification to `mul_mat_q`. Built and measured: with the patch, MMVQ verification still runs at 23.4 tok/s at depth 3 and 21.9 at depth 5, against 29.6 for MMQ. |
 | `DimInfer/Qwen3.8-27B-Dspark-v1`, requantized to Q4_K, at its author's recommended depth | 28.88 / 28.92 / 28.62 at n-max 4 / 5 / 6 with `p-min 0`. Its published mean accepted length of 3.807 at n-max 6 does not reproduce on this workload mix: measured 2.65 / 2.74 / 2.77, against 3.01 for the native MTP head. Their published figures are dominated by math and gsm8k, which speculate far better than chat or json. |
-
 | `xkm/qwen3.8-27b-mtp-head-retrained`, a retrained nextn head | Worse at equal cost. Swapped into the sidecar and requantized to match, it gives mean accepted length 2.85 against the stock head's 2.89. Its published gain is real but requires an F16 head, and on a card this bandwidth-starved the extra 682 MiB per draft step costs more than the acceptance buys. The same artifact wins on Apple Silicon, where the author measured it. |
-
 | An importance matrix for the draft head | Worth ~1% of accepted length and nothing measurable in throughput. Neither `mtp-Qwen3.8-27B-Q4_0.gguf` nor my Q2_K requantization of it carries imatrix metadata, so the draft head was the one uncalibrated component in the pipeline, and Q2_K is the most imatrix-sensitive quantization there is. Computing one (120 chunks of neutral public text, final PPL 3.86) and requantizing lifts accepted length 2.95 to 2.98 and first-position acceptance 0.760 to 0.772, but the file grows 0.4% and the two cancel: 31.83 against 31.84. |
 | The retrained nextn head on a matched quantization grid | Still worse. The obvious objection to the earlier result was that MLX affine g64 asymmetric requantized to GGUF Q4_0 g32 symmetric is the worst possible grid mismatch. Redone at Q4_K with the imatrix above, which is the near match: 31.27 and accepted length 2.94, against the stock head's 31.84 and 2.98. Three grids now (Q4_0, Q4_K with imatrix, F16) all land the same way. |
 | n-gram drafting at short match lengths | Still never pays. Retested with `ngram-simple` at match length 4 and 6 and `ngram-mod` at 8, on top of the chain configuration: 30.98, 31.43 and 31.58 against a 31.63 control. Short matches fire often enough to preempt MTP (n-gram has fixed dispatch priority) without drafting anything better. |
 | Host and OS tuning, as a bundle and individually | Noise, measured rather than assumed. Stopping docker, containerd, snapd, packagekit, unattended-upgrades, the Google agents, rsyslog and multipathd, plus transparent hugepages set to `always` and `vm.swappiness=0`, gives 31.20 against a 31.65 control; hugepages alone 31.23; the bundle repeated 31.26. `--threads` 8 / 4 / 2 gives 31.11 / 31.27 / 31.25, and `--prio 2` 31.24. All inside a ±0.5 spread. This is what a fully GPU-resident decode should look like: the host does about a millisecond of work per 33 ms token, so there is nothing there to win. Note also that the g2 shape exposes no cpufreq governor and no C-states, so those knobs do not exist to turn. |
-| Locking the SM clock to a steady value to avoid throttle oscillation | Nothing: 31.33 at 1245 MHz, 31.30 at 1350, 31.63 at 1500, against ~31.65 unlocked. |
 | `GGML_CUDA_DISABLE_GRAPHS=1`, `--cache-ram 0`, `--ctx-checkpoints 0` | Controls, all negative, which is the useful result: disabling CUDA graphs costs 2.3% (31.01 against 31.71), so graph capture is already working, and neither the prompt cache nor context checkpointing costs anything measurable. |
 
 A note on one misleading measurement, because it cost time. Measuring forward-pass cost by timing prompt processing shows a 3.3x step between width 4 and width 5, which does not exist in the decode path: the same widths measured through actual speculative decoding are flat. Prompt processing and speculative verification take different paths through the server. Measure the path you intend to optimize.
 
 ## Memory and context capacity
 
-The draft head is a second model resident in VRAM, so it is paid for in context. Table 6 reports VRAM with the server loaded and idle, on a 24,089 MiB device.
+The draft head is a second model resident in VRAM, so it is paid for in context. Table 13 reports VRAM with the server loaded and idle, on a 24,089 MiB device.
 
-**Table 6: VRAM against context size, tuned configuration.**
+**Table 13: VRAM against context size, tuned configuration.**
 
 | `--ctx-size` | VRAM used | Free |
 | --- | --- | --- |
@@ -473,7 +470,7 @@ If the full 104,192 matters more than the last 9%, drop `--spec-draft-model` and
 
 `scripts/verify-quality.sh` runs two independent checks against a `--spec-type none` reference: byte-level determinism and accuracy on 40 arithmetic problems with known ground truth. It captures three configurations so the kernel change and speculation can be told apart.
 
-**Table 7: quality checks.**
+**Table 14: quality checks.**
 
 | Configuration | Accuracy | Byte-identical to reference, per task |
 | --- | --- | --- |
@@ -506,9 +503,10 @@ To rebuild llama.cpp yourself, on any CUDA machine:
 bash scripts/build-llamacpp.sh ~/lcpp
 ```
 
-The build pins llama.cpp at b10454, applies `patches/0001-mmvq-runtime-crossover.patch`, and targets SM89 only. On 32 vCPUs it takes about four minutes; on the 8 vCPUs of a `g2-standard-8` allow twenty. Building on a separate CPU instance and copying `bin/` to `/opt/llama.cpp/build/bin` is faster and keeps the benchmark machine idle.
+The build checks out the head of [PR #27173](https://github.com/ggml-org/llama.cpp/pull/27173) (one-decode chain drafting, the `LLAMA_SPEC_CHAIN` feature this configuration depends on), applies `patches/0001-mmvq-runtime-crossover.patch`, and targets SM89 only. Set `PR=` and `SHA=<commit>` to pin a plain commit instead. On 32 vCPUs it takes about four minutes; on the 8 vCPUs of a `g2-standard-8` allow twenty. Building on a separate CPU instance and copying `bin/` to `/opt/llama.cpp/build/bin` is faster and keeps the benchmark machine idle.
 
 The patch is one predicate in `ggml/src/ggml-cuda/mmvq.cu` plus a log-level change in `common/speculative.cpp` that promotes llama.cpp's own speculative statistics (mean accepted length, per-position acceptance, cumulative drafting time) from trace to info. Every number in the cost model above came from that line; without it the only way to see drafting cost is `-lv 6`, which logs every draft candidate and slows generation by 30%.
+
 ## Network access
 
 The server binds `0.0.0.0` and has no authentication, so the firewall is the only thing standing between the model and the internet. The provisioning script defaults to `INTERNAL=1`, which tags the instance `llama-internal` and admits `tcp:8080` from RFC1918 only. `INTERNAL=0` opens it to `0.0.0.0/0` through the `llama-server` tag, which is convenient for a throwaway benchmark and wrong for anything that stays up.
@@ -538,9 +536,9 @@ Administrative access runs over IAP (`gcloud compute ssh --tunnel-through-iap`),
 
 ## Quantizations
 
-Table 8 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
+Table 15 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
 
-**Table 8: quantizations and fit on a 24 GB L4.**
+**Table 15: quantizations and fit on a 24 GB L4.**
 
 | File | Size | Fit |
 | --- | --- | --- |
@@ -585,7 +583,7 @@ The server runs under systemd as `qwen-server`, not under docker, because the pa
 
 On-demand L4 capacity is scarce. A typical run walks through nine or more zones returning `STOCKOUT` before one succeeds, so let the script cycle. Each retry recreates the instance, so read the external IP from `gcloud compute instances list` once the script reports READY.
 
-A stopped instance restarts with `bash scripts/start.sh`, keeping its disk, the models and the build, but the zone does not hold capacity for it. Restarts return `STOCKOUT` exactly as creation does, and a stopped instance cannot change zones, so the script retries in place until an L4 frees up. Serving flags come from instance metadata (`qwen-ctx`, `qwen-nmax`, `qwen-mmvq-max`), so a restart picks up whatever the metadata currently says.
+A stopped instance restarts with `bash scripts/start.sh`, keeping its disk, the models and the build, but the zone does not hold capacity for it. Restarts return `STOCKOUT` exactly as creation does, and a stopped instance cannot change zones, so the script retries in place until an L4 frees up. Serving flags come from instance metadata, so a restart picks up whatever the metadata currently says. `startup.sh` reads `qwen-ctx`, `qwen-nmax`, `qwen-mmvq-max`, `qwen-chain-sub` and `qwen-lcpp-pr` for serving and build behaviour, and `qwen-hf-repo` / `qwen-hf-file` / `qwen-draft-repo` / `qwen-draft-file` to choose the model and draft head; all have defaults, and `provision-ondemand.sh` sets only the first three.
 
 When `/health` never comes up, the boot log carries the reason:
 
@@ -605,6 +603,8 @@ gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -80 /var/l
 | `scripts/sweep-spec.sh` | speculative decoding parameter sweep; still drives the previous docker path, so point it at `/opt/llama.cpp/build/bin/llama-server` before use |
 | `scripts/max-context.sh` | binary search for the largest usable context; same caveat |
 | `scripts/verify-quality.sh` | determinism and accuracy checks |
+| `tools/bandwidth-probe.cu` | measure achievable DRAM bandwidth; used to separate the power tax from kernel slack |
+| `tools/capture-mtp-data.cpp` | capture MTP draft-head training data at prefill speed, for the drafter project the ceiling analysis points to |
 | `scripts/start.sh` | restart a stopped instance, retrying through STOCKOUT |
 | `scripts/teardown.sh` | stop or delete |
 
