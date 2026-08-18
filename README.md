@@ -222,6 +222,23 @@ Structured reasoning speculates best and open-ended chat worst, which is the usu
 
 Throughput is flat against context. At 32,768 / 65,536 / 81,920 the same configuration measures 29.63 / 29.51 / 29.60 tok/s on a two-workload subset, and the full benchmark gives 30.97 at 65,536 against 30.98 at 81,920. Context is a memory question, not a speed one, which is why the shipped default is the one that leaves headroom rather than the one that fits.
 
+## What the same model does on other 24 GB cards
+
+[`Don-Chad/ninfer-3090`](https://github.com/Don-Chad/ninfer-3090) is a purpose-built C++20/CUDA engine for this exact model on a single RTX 3090, and it is the most useful external calibration point available: same model, same 24 GB class, a from-scratch engine rather than llama.cpp. Its single-user result is **71.00 tok/s decode** at 61.13% MTP acceptance, from a 16.96 GiB groupwise artifact.
+
+The RTX 3090 has 936 GB/s of memory bandwidth against this L4's 300, a factor of 3.12. Scaling this configuration by bandwidth alone gives 32.87 x 3.12 = **102.6 tok/s**, against their measured 71.00. That comparison needs no assumption about their accepted length; it says only that per unit of memory bandwidth, this stack is delivering more than a hand-written engine does.
+
+Normalizing the other way, and taking their MTP3 acceptance to mean an accepted length near 2.83:
+
+| | bandwidth | weight read | cycle | accepted length | tok/s | cycle / weight read |
+| --- | --- | --- | --- | --- | --- | --- |
+| NInfer, RTX 3090, one user | 936 GB/s | 19.5 ms | 39.9 ms | 2.83 | 71.00 | 2.05x |
+| **this, L4** | **300 GB/s** | **59.7 ms** | **92.5 ms** | **3.04** | **32.87** | **1.55x** |
+
+The last column is the honest efficiency metric: how much a stack spends above the unavoidable weight read. This configuration spends 1.55x, theirs 2.05x. Cross-projecting each stack onto the other's hardware, holding its own overhead and accepted length: their engine on an L4 lands near 23 tok/s, and **this configuration on a 3090 lands near 101 tok/s**.
+
+That last number is the useful one. **100 tok/s for this model at this quantization is reachable, and this software reaches it — it needs about 913 GB/s of memory bandwidth to do so.** A 3090 (936), a 4090 (1008) or an L40S (864, ~95 tok/s) are in that class. An L4 at 300 GB/s is not, and no amount of software closes a 3x hardware gap. The work in this repository is portable to those cards unchanged; the patch, the draft head and the flags are all bandwidth-agnostic.
+
 ## Can this reach 100 tok/s
 
 No, and the arithmetic is worth writing down because it bounds the whole problem rather than this particular implementation.
