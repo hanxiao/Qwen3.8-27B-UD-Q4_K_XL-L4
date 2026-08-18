@@ -41,7 +41,13 @@ Decode is memory-bound, and llama.cpp reaches 84% of the datasheet peak. It is t
 
 So the weight-streaming path is leaving about 16% of this card's real bandwidth unused. Two things say that gap is kernel efficiency rather than physics: the streaming probe holds 2040 MHz while drawing only **45.6 W** against a 72 W cap, so streaming alone is neither power- nor clock-limited; and locking the SM clock anywhere between 900 and 2040 MHz moves decode throughput by under 2%, with the card at 63.6 W, so decode is not clock-limited either. The difference is that decode spends power and time on dequantization and on hundreds of dependent kernel boundaries that a single streaming kernel does not have.
 
-Closing that gap is worth more than anything else on the board: at 293.4 GB/s the weight read falls from 66.9 ms to 57.6 ms, which alone would take this configuration to about 36.7 tok/s. Nothing in llama.cpp exposes it as a setting, and it is not something a flag reaches, but it is the largest measured headroom that remains and it is not speculative.
+Closing that gap would be worth more than anything else on the board: at 293.4 GB/s the weight read falls from 66.9 ms to 57.6 ms, which alone would put this configuration near 36.7 tok/s. So it is worth knowing why it does not close.
+
+The first guess is the MMVQ launch configuration, since sm_89 matches no tuned table and falls through to `MMVQ_PARAMETERS_GENERIC`. Rebuilding with the decode case (`ncols_dst == 1`) retuned four ways measures 14.99 tok/s at the shipped `nwarps=4, rows_per_block=1`, against 14.90 at `nwarps=8`, 14.98 at `rows_per_block=2`, 14.97 at both, and 14.93 at `nwarps=2`. A 0.6% spread. The table is not the bottleneck.
+
+The power numbers explain it. The streaming probe holds 2040 MHz at **45.6 W**. Decode sits at the **72 W cap**. Decode is doing everything the probe does plus unpacking K-quant scales and running dot products, and on a 72 W card that extra ALU work competes with the memory subsystem for the same budget. That also resolves what looked like a contradiction earlier: locking the SM clock down to 900 MHz drops power to 63.6 W and leaves throughput flat, because the clock is not the binding constraint in that range either. Between roughly 900 MHz and the capped 1335 MHz the configuration is pinned at about 253 GB/s from two directions at once, and the 40 GB/s difference from a pure stream is the power cost of dequantization.
+
+That makes the 16% structural on this part rather than available. It is recoverable only by doing less ALU work per byte read, which means a different kernel family, not a different setting.
 
 Throughput therefore depends entirely on how many tokens each of those 66.9 ms passes emits:
 
