@@ -9,6 +9,8 @@ bash scripts/provision-ondemand.sh
 
 That command creates the instance, fetches the model and the draft head, builds a patched llama.cpp, starts an OpenAI-compatible server and blocks until it answers on `/health`. Every number below was measured on the machine it provisions, on 2026-08-17 and 2026-08-18.
 
+This repository also answers the question it was started to answer, which was whether this model can be served at 100 tok/s on this card. It cannot, and [the reason is arithmetic rather than engineering](#can-this-reach-100-toks): the 15.75 GiB weight read is irreducible at this quantization, so 100 tok/s requires 6.7 accepted tokens per target forward pass against 3.01 measured here and 4.09 as the best figure published for this model anywhere. Below draft depth 11 the requirement exceeds what the depth can supply even at perfect acceptance. What the work did produce is a 34% speedup, a cost model that says where every millisecond goes, and a long list of measured negatives.
+
 ## Summary of the change
 
 Six changes moved throughput, in descending order of size. None of them changes the weights, the quantization, or the sampling: speculative decoding emits a drafted token only after the target model verifies it, and the kernel change swaps which CUDA kernel evaluates the same matmul. Both can reorder floating-point reductions and so flip tokens that were near ties; measured accuracy is unchanged, and the Quality section reports the checks.
