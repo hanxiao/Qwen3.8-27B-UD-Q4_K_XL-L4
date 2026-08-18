@@ -216,7 +216,7 @@ Table 4 reports decode throughput from `scripts/bench.sh`. The metric is `timing
 | chat | 23.24 | **29.45** | 1.27x | 2.65 |
 | **average** | **24.18** | **32.96** | **1.36x** | **3.04** |
 
-The previous column is this repository's earlier measurement; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. Repeat passes of the shipped configuration gave 32.88 and 32.96; the global-crossover configuration it replaced gave 32.42, 32.41 and 32.49.
+The previous column is this repository's earlier measurement; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. Repeat passes of the shipped configuration gave 32.88, 32.96 and, on a later day after the machine had been power- and clock-swept and restored, 32.43; call the run-to-run band 32.4 to 33.0. The global-crossover configuration it replaced gave 32.42, 32.41 and 32.49.
 
 Structured reasoning speculates best and open-ended chat worst, which is the usual shape: the gain tracks how predictable the next token is, and `math` reaches 3.53 accepted tokens per pass against `chat` at 2.70.
 
