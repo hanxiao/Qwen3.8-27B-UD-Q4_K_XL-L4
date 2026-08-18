@@ -20,7 +20,8 @@
 # Env:    SHA (llama.cpp commit), JOBS
 set -euo pipefail
 
-SHA="${SHA:-4df29be4f4c3673f428170fda944a5b19f743bb8}"   # b10454
+PR="${PR:-27173}"          # one-decode chain drafting, see README
+SHA="${SHA:-}"             # empty = build the PR head; set to pin a plain commit instead
 OUT="${1:-$HOME/lcpp}"
 JOBS="${JOBS:-$(nproc)}"
 SRC="${SRC:-$HOME/llama.cpp-build}"
@@ -36,8 +37,13 @@ if [ ! -d "$SRC/.git" ]; then
   git init "$SRC"
   git -C "$SRC" remote add origin https://github.com/ggml-org/llama.cpp.git
 fi
-git -C "$SRC" fetch --depth 1 origin "$SHA"
-git -C "$SRC" checkout -f FETCH_HEAD
+if [ -n "$SHA" ]; then
+  git -C "$SRC" fetch --depth 1 origin "$SHA"
+  git -C "$SRC" checkout -f FETCH_HEAD
+else
+  git -C "$SRC" fetch --depth 1 origin "pull/$PR/head:pr$PR"
+  git -C "$SRC" checkout -f "pr$PR"
+fi
 git -C "$SRC" apply "$PATCH"
 
 cmake -S "$SRC" -B "$SRC/build" \
