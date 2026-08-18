@@ -37,7 +37,11 @@ Everything below follows from three measured quantities. Table 1 gives the first
 | Target forward pass, batch 1 | 66.9 ms | `--spec-type none` decode at 14.95 tok/s |
 | Effective memory bandwidth | 252.8 GB/s | 15.75 GiB / 66.9 ms, against a 300.05 GB/s datasheet peak |
 
-Decode is memory-bound and llama.cpp already reaches 84% of the datasheet peak, which is close to what GDDR6 delivers in practice. Locking the SM clock anywhere between 900 and 2040 MHz changes throughput by less than 2%, and at 900 MHz the card draws 63.6 W against a 72 W cap, so the clock is not the limit either. There is nothing to win in the batch-1 pass.
+Decode is memory-bound, and llama.cpp reaches 84% of the datasheet peak. It is tempting to call that the practical GDDR6 roofline and stop. It is not, and `tools/bandwidth-probe.cu` shows it: a plain `float4` streaming read over an 8 GiB buffer, 170x the 48 MB L2, sustains **293.4 GB/s, or 97.8% of datasheet**, reproducing at 16 GiB and at both 256 and 512 threads per block.
+
+So the weight-streaming path is leaving about 16% of this card's real bandwidth unused. Two things say that gap is kernel efficiency rather than physics: the streaming probe holds 2040 MHz while drawing only **45.6 W** against a 72 W cap, so streaming alone is neither power- nor clock-limited; and locking the SM clock anywhere between 900 and 2040 MHz moves decode throughput by under 2%, with the card at 63.6 W, so decode is not clock-limited either. The difference is that decode spends power and time on dequantization and on hundreds of dependent kernel boundaries that a single streaming kernel does not have.
+
+Closing that gap is worth more than anything else on the board: at 293.4 GB/s the weight read falls from 66.9 ms to 57.6 ms, which alone would take this configuration to about 36.7 tok/s. Nothing in llama.cpp exposes it as a setting, and it is not something a flag reaches, but it is the largest measured headroom that remains and it is not speculative.
 
 Throughput therefore depends entirely on how many tokens each of those 66.9 ms passes emits:
 
@@ -212,7 +216,7 @@ Throughput is flat against context. At 32,768 / 65,536 / 81,920 the same configu
 
 No, and the arithmetic is worth writing down because it bounds the whole problem rather than this particular implementation.
 
-100 tok/s is 10 ms per token. One target forward pass reads 15.75 GiB of weights, and that read is unavoidable: the model is dense, every byte is touched once per pass, and there is no reuse to exploit. At the measured 252.8 GB/s that pass costs 66.9 ms, and at the datasheet 300.05 GB/s it would still cost 56.4 ms. So a pass must emit at least 6.7 tokens, and that is before charging anything for drafting or for the extra width of the verification batch.
+100 tok/s is 10 ms per token. One target forward pass reads 15.75 GiB of weights, and that read is unavoidable: the model is dense, every byte is touched once per pass, and there is no reuse to exploit. At the 252.8 GB/s llama.cpp currently achieves that pass costs 66.9 ms, so a pass must emit 6.7 tokens. Give it the full 293.4 GB/s the card is measured to deliver and the pass costs 57.6 ms, so it must still emit **5.8 tokens** — and that is before charging anything for drafting or for the extra width of the verification batch.
 
 Mean accepted length is therefore the entire problem, and Table 5 says where it actually is.
 
@@ -229,7 +233,7 @@ Mean accepted length is therefore the entire problem, and Table 5 says where it 
 
 The MTP head saturates at 3.21 because its per-position acceptance decays: 0.78, 0.55, 0.35, 0.25, 0.18, 0.10, 0.07. Drafting deeper adds cost and almost no accepted tokens. Nothing published for Qwen3.8-27B reaches 6.7. The gap is a factor of 1.6 against the best figure reported for this model on any quantization, and 2.1 against the best reported on this one.
 
-Two idealized bounds make the headroom concrete. Give drafting away for free and keep the measured verification cost: 3.21 / 100.1 ms is 32.1 tok/s. Give away drafting *and* all verification width, so every pass costs the bare 66.9 ms weight read: 3.21 / 66.9 ms is 48.0 tok/s. The configuration here reaches 32.9, which is past the first bound. The remaining distance to 100 tok/s is not implementation slack. It is the drafter.
+Three idealized bounds make the headroom concrete. Give drafting away for free and keep the measured verification cost: 3.21 / 100.1 ms is 32.1 tok/s. Give away drafting *and* all verification width, so every pass costs the bare 66.9 ms weight read: 3.21 / 66.9 ms is 48.0 tok/s. Give away the 16% of bandwidth the kernels do not use as well, so the pass costs 57.6 ms: 3.21 / 57.6 ms is 55.7 tok/s. The configuration here reaches 32.9, which is past the first bound. The remaining distance to 100 tok/s is not implementation slack. It is the drafter.
 
 The same arithmetic answers a nearer question, 40 tok/s, which is worth writing down because it is close enough to argue about. At the shipped accepted length of 3.01, 40 tok/s means a 75.2 ms cycle. The current cycle is 92.4 ms: 66.9 ms of weight read, about 9 ms of MMQ admission cost, 7.9 ms of verification width, and 8.3 ms of drafting. Removing the MMQ penalty alone gives 36.2. Removing it and halving drafting gives 38.3. Reaching 40 requires essentially all of the kernel overhead to go, or accepted length to rise from 3.01 to about 3.7. Both are real projects: the first is a Marlin-class kernel for K-quants at M=6, the second is a trained draft head. Neither is a flag.
 
