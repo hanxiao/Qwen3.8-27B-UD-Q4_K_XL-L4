@@ -187,16 +187,16 @@ Table 4 reports decode throughput from `scripts/bench.sh`. The metric is `timing
 
 | Workload | Previous (tok/s) | Tuned (tok/s) | Speedup | Tuned mean accepted length |
 | --- | --- | --- | --- | --- |
-| math | 24.54 | **37.83** | 1.54x | 3.61 |
-| summarization | 24.63 | **34.10** | 1.38x | 3.05 |
-| multi-turn | 23.69 | **31.97** | 1.35x | 2.86 |
-| json | 22.92 | **31.54** | 1.38x | 2.83 |
-| code | 23.67 | **31.20** | 1.32x | 2.79 |
-| prose | 22.96 | **30.69** | 1.34x | 2.75 |
-| chat | 23.24 | **29.52** | 1.27x | 2.64 |
-| **average** | **24.18** | **32.88** | **1.36x** | **3.04** |
+| math | 24.54 | **37.75** | 1.54x | 3.60 |
+| summarization | 24.63 | **34.77** | 1.41x | 3.13 |
+| multi-turn | 23.69 | **33.38** | 1.41x | 3.01 |
+| code | 23.67 | **32.57** | 1.38x | 2.91 |
+| json | 22.92 | **31.64** | 1.38x | 2.84 |
+| prose | 22.96 | **31.16** | 1.36x | 2.77 |
+| chat | 23.24 | **29.45** | 1.27x | 2.65 |
+| **average** | **24.18** | **32.96** | **1.36x** | **3.04** |
 
-The previous column is this repository's earlier measurement; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. The tuned column is the global-crossover configuration measured per workload; the shipped per-type configuration measures 32.88 on the same seven-workload pass, 1.4% above it. Repeat passes: 32.42, 32.41, 32.49 global, 32.88 per-type.
+The previous column is this repository's earlier measurement; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. Repeat passes of the shipped configuration gave 32.88 and 32.96; the global-crossover configuration it replaced gave 32.42, 32.41 and 32.49.
 
 Structured reasoning speculates best and open-ended chat worst, which is the usual shape: the gain tracks how predictable the next token is, and `math` reaches 3.53 accepted tokens per pass against `chat` at 2.70.
 
