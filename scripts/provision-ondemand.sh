@@ -17,7 +17,7 @@
 #    through STOCKOUT zones before one lands. That is the script working, not failing.
 #
 # Usage:  bash scripts/provision-ondemand.sh
-# Env:    INSTANCE, MACHINE, PROJECT, ZONES, FIT_TARGET, KV, NMAX, MMVQ_MAX, INTERNAL
+# Env:    INSTANCE, MACHINE, PROJECT, ZONES, FIT_TARGET, KV, NMAX, MMVQ_MAX, INTERNAL, DISK
 set -euo pipefail
 
 INSTANCE="${INSTANCE:-qwen38-27b-l4-od}"
@@ -25,6 +25,9 @@ MACHINE="${MACHINE:-g2-standard-8}"
 PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
 # The context size is planned on the instance by llama.cpp --fit; what is set here is
 # the margin it must leave free and the KV cache type, which together decide the window.
+# Boot disk in GB. 120 serves the model; capture work for a draft head needs far more,
+# at about 10.3 GB per million tokens of hidden state.
+DISK="${DISK:-120}"
 FIT_TARGET="${FIT_TARGET:-768}"
 KV="${KV:-q4_0}"
 NMAX="${NMAX:-5}"
@@ -68,7 +71,7 @@ for z in $ZONES; do
       --maintenance-policy=TERMINATE \
       --image-family=common-cu129-ubuntu-2204-nvidia-580 \
       --image-project=deeplearning-platform-release \
-      --boot-disk-size=120GB --boot-disk-type=pd-ssd \
+      --boot-disk-size=${DISK}GB --boot-disk-type=pd-ssd \
       --tags="$NET_TAG" \
       --metadata="qwen-fit-target=$FIT_TARGET,qwen-kv=$KV,qwen-nmax=$NMAX,qwen-mmvq-max=$MMVQ_MAX" \
       --metadata-from-file="$META" 2>&1 | tail -3; then

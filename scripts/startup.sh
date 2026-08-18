@@ -5,7 +5,10 @@ set -e
 exec >>/var/log/qwen-startup.log 2>&1
 echo "[startup] boot $(date -u +%H:%M:%S)"
 
-md() { curl -s -H 'Metadata-Flavor: Google' \
+# -f matters: without it curl prints the metadata server's 404 HTML page on an unset key, and
+# a non-empty value defeats every ${VAR:-default} below. That fails late and confusingly - the
+# model URL becomes an error page, the download writes a 0-byte file, and the build never runs.
+md() { curl -sf -H 'Metadata-Flavor: Google' \
   "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" 2>/dev/null; }
 
 # The context is planned by llama.cpp, not set here: --fit sizes it to the device with
