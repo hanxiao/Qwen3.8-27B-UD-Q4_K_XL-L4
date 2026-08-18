@@ -62,7 +62,20 @@ Table 2 is the consequence. Both columns verify identical batches of identical w
 | 12 | | 100.1 ms |
 | 16 | | 106.2 ms |
 
-Under MMVQ each additional verified token costs 9 ms going from width 1 to 3 and 26 ms going from 3 to 4. Under MMQ the whole range from 2 to 16 costs 2.3 ms per token. That is the difference between a draft depth of 2 being optimal and a draft depth of 5 being optimal, and it is worth 16%.
+Under MMVQ each additional verified token costs 9 ms going from width 1 to 3 and 26 ms going from 3 to 4. Under MMQ the whole range from 2 to 16 costs about 2 ms per token. That is the difference between a draft depth of 2 being optimal and a draft depth of 5 being optimal, and it is worth 16%.
+
+Fitting both kernels separates two distinct costs:
+
+```
+T_MMVQ(B) = 66.9 + ~9.3·(B-1) ms        streams weights at 252.8 GB/s, but each
+                                        extra column costs almost a whole pass
+T_MMQ(B)  = 66.9 + 9.7 + 1.98·(B-1) ms  a flat 9.7 ms worse at the same width,
+                                        then nearly free per extra token
+```
+
+MMQ is behind at width 1 and 2 and ahead from width 3, which is exactly where `GGML_MMVQ_MAX=2` puts the boundary. The 9.7 ms is the price of admission: MMQ stages weights through shared memory in tiles rather than streaming them, so it does not reach MMVQ's bandwidth on the same bytes. Since MMQ's smallest tile is 8 columns (`mmq.cuh`, `for (int J = 8; J <= 128; J += 8)`), widths 2 through 8 issue identical tensor-core and unpack work, so that 9.7 ms is genuinely fixed rather than something the draft depth can amortize away.
+
+This is now the largest single removable cost in the cycle, and nothing in llama.cpp removes it. Closing it needs a mixed-precision GEMM that keeps streaming efficiency at M=6, which is what Marlin and Machete do for W4A16 in other stacks and what llama.cpp does not have for K-quants.
 
 This is not reachable by configuration. `GGML_CUDA_FORCE_MMQ` is a compile-time flag evaluated inside `ggml_cuda_should_use_mmq`, which the dispatcher never calls once `ggml_cuda_should_use_mmvq` has returned true. `patches/0001-mmvq-runtime-crossover.patch` adds a `GGML_MMVQ_MAX` environment variable to that one predicate. Setting it to 2 keeps MMVQ for plain batch-1 decode, where MMVQ is genuinely faster, and routes everything wider to MMQ.
 
@@ -194,6 +207,8 @@ Mean accepted length is therefore the entire problem, and Table 5 says where it 
 The MTP head saturates at 3.21 because its per-position acceptance decays: 0.78, 0.55, 0.35, 0.25, 0.18, 0.10, 0.07. Drafting deeper adds cost and almost no accepted tokens. Nothing published for Qwen3.8-27B reaches 6.7. The gap is a factor of 1.6 against the best figure reported for this model on any quantization, and 2.1 against the best reported on this one.
 
 Two idealized bounds make the headroom concrete. Give drafting away for free and keep the measured verification cost: 3.21 / 100.1 ms is 32.1 tok/s. Give away drafting *and* all verification width, so every pass costs the bare 66.9 ms weight read: 3.21 / 66.9 ms is 48.0 tok/s. The configuration here reaches 32.4, which is essentially at the first bound. The remaining distance to 100 tok/s is not implementation slack. It is the drafter.
+
+The same arithmetic answers a nearer question, 40 tok/s, which is worth writing down because it is close enough to argue about. At the shipped accepted length of 3.01, 40 tok/s means a 75.2 ms cycle. The current cycle is 92.8 ms: 66.9 ms of weight read, 9.7 ms of MMQ admission cost, 7.9 ms of verification width, and 8.3 ms of drafting. Removing the MMQ penalty alone gives 36.2. Removing it and halving drafting gives 38.3. Reaching 40 requires essentially all of the kernel overhead to go, or accepted length to rise from 3.01 to about 3.7. Both are real projects: the first is a Marlin-class kernel for K-quants at M=6, the second is a trained draft head. Neither is a flag.
 
 What would close it is a draft head with mean accepted length near 7, which means a trained head rather than a better-tuned one. The published recipes that reach 5.3 to 5.5 on comparable targets regenerate 12,000 to 40,000 answers from the served quantized target, capture hidden states from the GGUF itself, warm-start from an existing head of the same geometry, and train for 6 to 10 hours on a 96 GB card. That is the identified next step, and it is a training project, not a serving one. A second, cheaper lever is tree drafting: verification width is now nearly free up to 16 tokens, so spending that width on several candidate branches instead of one chain should raise accepted length by roughly a third. llama.cpp has no tree support in any speculative implementation, and adding it needs per-token attention masks that the current API does not expose.
 
