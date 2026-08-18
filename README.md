@@ -380,6 +380,32 @@ Three idealized bounds make the headroom concrete. Give drafting away for free a
 
 The same arithmetic answers a nearer question, 40 tok/s, which is worth writing down because it is close enough to argue about. At the shipped accepted length of 3.01, 40 tok/s means a 75.2 ms cycle. The current cycle is 92.4 ms: 66.9 ms of weight read, about 9 ms of MMQ admission cost, 7.9 ms of verification width, and 8.3 ms of drafting. Removing the MMQ penalty alone gives 36.2. Removing it and halving drafting gives 38.3. Reaching 40 requires essentially all of the kernel overhead to go, or accepted length to rise from 3.01 to about 3.7. Both are real projects: the first is a Marlin-class kernel for K-quants at M=6, the second is a trained draft head. Neither is a flag.
 
+One more form of the question is worth settling, because "not with this drafter" invites "then with which drafter?". Sweep the draft depth and ask what accepted length each depth would need, against the ceiling that depth itself imposes, since accepted length can never exceed depth + 1:
+
+**Table 5b: what 100 tok/s would require at each draft depth.**
+
+| Draft depth | Verify width | Cycle | Accepted length needed for 100 tok/s | Ceiling (depth + 1) |
+| --- | --- | --- | --- | --- |
+| 5 | 6 | 92.1 ms | 9.21 | 6 |
+| 7 | 8 | 98.6 ms | 9.86 | 8 |
+| 9 | 10 | 114.1 ms | 11.41 | 10 |
+| 11 | 12 | 120.5 ms | 12.05 | 12 |
+| 15 | 16 | 133.5 ms | 13.35 | 16 |
+
+Up to depth 11 the requirement exceeds what the depth can physically supply even at 100% acceptance, so 100 tok/s is arithmetically impossible there for any drafter whatsoever. From depth 15 it stops being impossible and starts being absurd instead. A 133.5 ms cycle needs 13.35 accepted tokens out of 15 drafted, which at uniform per-position acceptance means **about 97.5% at every one of fifteen consecutive positions** (p = 0.95 yields 11.20, p = 0.97 yields 12.86, p = 0.975 yields 13.32). The head measured here runs 0.78, 0.55, 0.35, 0.25, 0.18, 0.10, 0.07 and is under 10% by position six; the best first-position acceptance published for this model anywhere is 0.855, decaying from there.
+
+A drafter that held 97.5% for fifteen straight tokens would be reproducing the target's output almost exactly, at which point it is the model and the 27B target is redundant. That is the honest shape of the answer. 100 tok/s here is not blocked by a missing optimization; it is blocked by requiring a drafter good enough to make the thing it drafts for unnecessary.
+
+The same table read at 40 tok/s is much friendlier, and is the useful number to take away:
+
+| Accepted length | Source | Best depth | Throughput | With a perfect kernel |
+| --- | --- | --- | --- | --- |
+| 3.01 | measured here | 5 | 32.7 | 36.2 |
+| 4.09 | best published for this model, on Q4_K_M / GSM8K | 7 | **41.5** | 45.7 |
+| 5.5 | best published EAGLE3-class training recipe | 9 | 48.2 | 52.4 |
+
+So 40 tok/s needs a drafter no better than the best figure already published for this model, and roughly 50 tok/s is what a state-of-the-art trained head would be worth here. Both are drafter projects, and neither requires a single further kernel change.
+
 What would close it is a draft head with mean accepted length near 7, which means a trained head rather than a better-tuned one. The published recipes that reach 5.3 to 5.5 on comparable targets regenerate 12,000 to 40,000 answers from the served quantized target, capture hidden states from the GGUF itself, warm-start from an existing head of the same geometry, and train for 6 to 10 hours on a 96 GB card. That is the identified next step, and it is a training project, not a serving one. A second, cheaper lever is tree drafting: verification width is now nearly free up to 16 tokens, so spending that width on several candidate branches instead of one chain should raise accepted length by roughly a third. llama.cpp has no tree support in any speculative implementation, and adding it needs per-token attention masks that the current API does not expose.
 
 ## What did not work
