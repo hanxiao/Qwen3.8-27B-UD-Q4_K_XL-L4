@@ -33,19 +33,34 @@ The same card will not serve this model at 100 tok/s, and [the limit is arithmet
 
 ## Summary
 
-Six elements of the configuration carry it, in descending order of what each is worth. None of them changes the weights, the quantization, or the sampling: speculative decoding emits a drafted token only after the target model verifies it, and the kernel change swaps which CUDA kernel evaluates the same matmul. Both can reorder floating-point reductions and so flip tokens that were near ties; measured accuracy is unchanged, and the Quality section reports the checks.
+Five elements carry the configuration, in descending order of what each is worth. None of them
+changes the weights below the `UD-Q4_K_XL` floor, and none changes the sampling: speculative decoding
+emits a drafted token only after the target verifies it, and the kernel change swaps which CUDA
+kernel evaluates the same matmul. Both reorder floating-point reductions and so flip tokens that were
+near ties; measured accuracy is unchanged, and the Quality section reports the checks.
 
 | Element | Decode (tok/s) | Worth |
 | --- | --- | --- |
-| A stock deployment: MTP at draft depth 2, `p-min` 0.4 | 24.14 | |
+| A stock deployment: the native MTP head at draft depth 2, `p-min` 0.4 | 24.14 | |
 | Route speculative verification to the MMQ kernel | 28.05 | +16.2% |
-| Draft from a separate, cheaper MTP head | 30.39 | +8.3% |
-| Retype the output tensor of that head to Q2_K, n-max 5 | 30.7 | +1.1% |
+| Draft from a separate, cheaper head with a Q2_K output tensor | 30.7 | +9.4% |
 | Sample on the GPU (`-bs`) instead of copying 248,320 logits per verified position to the host | 31.0 | +0.9% |
-| Draft the whole chain in one decode, with a 98,304-wide draft sub-head | 32.4 | +4.7% |
-| Route Q6_K and IQ4_XS back to MMVQ, per quant type | **32.9** | +1.4% |
+| Replace the native head with a block-diffusion drafter | 35.99 | +15.0% |
+| Take the 2026-08-19 rebuild of the weights | **37.86** | +5.2% |
 
-The first element is a one-line patch to llama.cpp. The rest of this README explains why, because the reasoning generalizes to any speculative decoding setup on a compute-poor card.
+The first element is a one-line patch to llama.cpp. The rest of this README explains why, because the
+reasoning generalizes to any speculative decoding setup on a compute-poor card.
+
+The first four rows were measured on the build this repository used before the block drafter, which
+is a different llama.cpp branch. The block-drafter row is therefore quoted from the same-binary
+comparison that isolates it: 31.30 tok/s for the native head against 35.99 for the block drafter,
+with only the drafter changed.
+
+Two elements this repository previously shipped are no longer in the configuration and are kept in
+the text because the measurements behind them are still the reason. Chain drafting, worth 4.7%, is an
+optimization for drafting one token per decode and has nothing to do for a drafter that emits a whole
+block per pass. Returning `Q6_K` and `IQ4_XS` to MMVQ, worth 1.4%, was tuned at a narrower
+verification width and loses 3.4 tok/s at the width a block drafter verifies.
 
 ## Cost model
 
@@ -132,7 +147,13 @@ Two adjacent surfaces are fixed by the hardware. The MMQ tile table (`mmq-config
 
 This is not reachable by configuration. `GGML_CUDA_FORCE_MMQ` is a compile-time flag evaluated inside `ggml_cuda_should_use_mmq`, which the dispatcher never calls once `ggml_cuda_should_use_mmvq` has returned true. `patches/0001-mmvq-runtime-crossover.patch` adds a `GGML_MMVQ_MAX` environment variable to that one predicate. Setting it to 2 keeps MMVQ for plain batch-1 decode, where MMVQ is genuinely faster, and routes everything wider to MMQ.
 
-## Draft head
+## The native draft head
+
+This section describes the drafter this configuration used before the block drafter, and the
+measurements are kept because they are the reason the block drafter wins: they establish that
+drafting is bandwidth-bound and that draft precision is not output precision. The shipped
+configuration drafts with DFlash 2 instead, measured at 35.99 tok/s against 31.30 for the head below
+on the same binary.
 
 The second cost in the model is drafting. Qwen3.8-27B ships a native MTP block, and llama.cpp drafts by running that block plus an output projection once per drafted token. The block is 272 MiB. The output projection is the `output.weight` of the target, which at Q6_K over a 248,320-token vocabulary is 994.6 MiB, so 78% of each draft step is the LM head.
 
@@ -153,6 +174,12 @@ The block is the other half of the draft read, 227.6 MiB against 157 MiB for the
 Accepted length does not fall across a 2.0x change in head size, so the whole saving is real. Q3_K sits between Q4_0 and Q2_K in size but measured worse than both, 28.89 tok/s against 29.20 and 29.91 on the same two workloads: its first-position acceptance fell to 0.746, against 0.779 for Q4_0 and 0.763 for Q2_K, which cost more than the bandwidth it saved. Q2_K is the floor that still holds acceptance.
 
 ## Chain drafting
+
+Chain drafting is not in the shipped configuration. It optimizes drafting one token per decode, and
+a block drafter emits a whole block in a single pass, so there is nothing left for it to remove. It
+lives on a different llama.cpp branch from the one that carries DFlash 2. The measurements are kept
+because the sub-head observation below is the same mechanism that makes a cheap draft output tensor
+work at all.
 
 llama.cpp drafts autoregressively: one `llama_decode` per drafted token, each followed by a host round trip to pick the token from a full 248,320-wide logit row. At draft depth 5 that is five GPU calls and five 993 KB transfers per decode cycle.
 
@@ -186,21 +213,35 @@ Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2,
 --parallel 1 --flash-attn on --fit on --fit-target 1792
 --ctx-checkpoints 4 --checkpoint-min-step 16384
 -ub 512 -b 2048 --cache-type-k q4_0 --cache-type-v q4_0 --no-mmap --threads 8
---spec-type draft-mtp
---spec-draft-model /opt/models/mtp-o2k.gguf --spec-draft-ngl 99
---spec-draft-n-max 5 --spec-draft-n-min 5 --spec-draft-p-min 0.0
+--spec-type draft-dflash
+--spec-draft-model /opt/models/dflash2-q4km.gguf --spec-draft-ngl 99
+--spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.0
 -bs --jinja --tools all --metrics
 ```
 
-with `GGML_MMVQ_MAX=2 GGML_MMVQ_MAX_Q6K=8 GGML_MMVQ_MAX_IQ4XS=8 LLAMA_SPEC_CHAIN=1 LLAMA_SPEC_CHAIN_SUB=98304 LLAMA_SCHED_POOL=8` in the environment.
+with `GGML_MMVQ_MAX=2 GGML_MMVQ_MAX_Q6K=2 GGML_MMVQ_MAX_IQ4XS=2 LLAMA_SCHED_POOL=8` in the
+environment, against a binary built from llama.cpp [PR #27342](https://github.com/ggml-org/llama.cpp/pull/27342)
+with `patches/0001-mmvq-runtime-crossover.patch` applied.
 
-`--spec-draft-p-min 0.0` disables the confidence gate. That gate exists to suppress drafts that are likely to be rejected, and it was worth 4% when a draft step cost 5.3 ms and a rejected draft made verification 26 ms more expensive. At 2.73 ms per draft step and 2.3 ms per unit of verification width, a rejected draft is cheap enough that suppressing it costs more than it saves. Measured at n-max 3 with the cheap head: p-min 0.0 gives 28.71 tok/s, 0.3 gives 27.11, 0.5 gives 26.17, 0.6 gives 25.13.
+`--spec-draft-n-max 7` is the block size minus one. The drafter declares `dflash.block_size = 8` and
+llama.cpp clamps the request to `block_size - 1`, warning when it does. The clamp mutates a copy while
+`need_n_rs_seq()` sizes the target recurrent state from the value as given, so asking for 8 or 9
+drafts exactly 7 tokens and spends 299 or 598 MiB of VRAM to do it. Ask for 7.
 
-`--spec-draft-n-min` equal to `--spec-draft-n-max` fixes the draft length, which keeps the verification batch a constant shape and improves CUDA graph reuse.
+`--spec-draft-n-min 1` matters more than it looks. The check is `result.size() < n_min`, and it
+discards the whole draft when it fails, so a value above what the drafter produces silently disables
+speculation rather than shortening it.
 
-`-bs` moves sampling onto the GPU. Without it the server copies a full logit row, 248,320 floats or 993 KB, to the host for every verified position; at width 6 that is roughly 6 MB per decode cycle over PCIe gen3 plus a host-side argmax. It is worth about 1%, small because the copy partly overlaps, but it is free.
+`--spec-draft-p-min 0.0` is the default and the only correct value here: the DFlash 2 branch returns
+before the confidence gate is reached, so the parameter is never read and the block is drafted in
+full every round.
 
-ECC must be disabled, as before. `nvidia-smi -e 0` plus a reboot returns about 1 GB of VRAM, and this configuration does not fit without it. The provisioning script performs this on first boot.
+`-bs` moves sampling onto the GPU. Without it the server copies a full logit row, 248,320 floats or
+993 KB, to the host for every verified position; at width 8 that is roughly 8 MB per decode cycle
+over PCIe gen3 plus a host-side argmax.
+
+ECC must be disabled. `nvidia-smi -e 0` plus a reboot returns about 1 GB of VRAM, and this
+configuration does not fit without it. The provisioning script performs this on first boot.
 
 ## Architecture
 
