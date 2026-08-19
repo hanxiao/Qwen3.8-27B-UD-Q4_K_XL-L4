@@ -1,6 +1,6 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 32.4 tok/s decode over a 127,488-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.34x the 24.1 tok/s this repository previously served, at identical weight quantization and with no measured quality regression. The window comes from a q4_0 KV cache; the weights are `UD-Q4_K_XL` in both configurations.
+Qwen3.8-27B serves at 32.5 tok/s decode over an 81,664-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.35x the 24.1 tok/s this repository previously served, at identical weight quantization and with no measured quality regression. The window comes from a q4_0 KV cache; the weights are `UD-Q4_K_XL` in both configurations.
 
 ```bash
 gcloud config set project <your-project>
@@ -163,7 +163,8 @@ Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2,
 ## Serving configuration
 
 ```
---parallel 1 --flash-attn on --fit on --fit-target 768
+--parallel 1 --flash-attn on --fit on --fit-target 1792
+--ctx-checkpoints 4 --checkpoint-min-step 16384
 -ub 512 -b 2048 --cache-type-k q4_0 --cache-type-v q4_0 --no-mmap --threads 8
 --spec-type draft-mtp
 --spec-draft-model /opt/models/mtp-o2k.gguf --spec-draft-ngl 99
@@ -420,8 +421,8 @@ Measured and rejected, so they need not be tried again.
 | `RadixArk` / `erlidev` block-7 DSpark heads | 18.6 to 23.1 tok/s, worse. Per-position acceptance 0.81, 0.39, 0.18. |
 | n-gram and suffix drafting (`ngram-mod`, `ngram-simple`, `ngram-map-k`) | Never fires. Over a 256-token generation from a short prompt it produced 0 to 7 draft tokens total. There is no repeated history to mine at this generation length. |
 | Bypassing L1 for global loads (`-Xptxas -dlcm=cg`) | Worse, and the reason matters more than the result. Decode reads 15.75 GiB of weights with no reuse whatsoever, so every L1 tag lookup and fill on that stream is spent for nothing, and on a card pinned at its power cap that waste should be worth reclaiming. Built with the flag and alternated against the deployed binary twice: 30.72 and 30.77 tok/s against 31.38 and 31.12, a consistent 1.6% loss. The flag is indiscriminate, and the loads it also bypasses are the ones that *do* have reuse: the q8_1-quantized activation tile is read by every block in the grid. A surgical version, `__ldcg` on the weight tiles only, would avoid that, but the measurement above argues it would not pay either, because the gap it is aimed at is not a cache-efficiency gap. |
-| A higher-precision recurrence-control projection | No gain, and the file that has it drafts worse. Quantizing the Gated DeltaNet control projections hard is a known way to damage this architecture: a build that keeps `in_proj_a` and `in_proj_b` in higher precision degrades only subtly, while a generic every-Linear recipe hits them. This file does hit them, at Q4_K for `ssm_alpha` and `ssm_beta`, the lowest precision it contains; `AtomicChat/Qwen3.8-27B-GGUF` lifts the same tensors to Q8_0 for 11.4 MiB more. Since the draft head reads hidden states that pass through that recurrence, the plausible reading was that the coarser projection suppresses acceptance. Measured on one machine with one draft head and only the target file changed: mean accepted length 3.22 for this file against 2.76 for the one with the Q8_0 projections, and 32.90 tok/s against 31.37. The build carrying the fix drafts half a token worse per pass, so the hypothesis is dead and no requantization follows from it. |
-| A bfloat16 recurrent state | Blocked by the ggml operator set, not by configuration. SGLang serves this model family with `--mamba-ssm-dtype bfloat16`, which halves a state slot from 153.9 to 78.4 MB; llama.cpp hard-codes `GGML_TYPE_F32` at every recurrent-memory construction site. Halving it would halve both the per-verification state snapshot, worth about 3.9% of the cycle, and the per-checkpoint cost. Making the type selectable is six lines, and the server then aborts on the first decode: `ggml-cuda/scale.cu:28: GGML_ASSERT(src0->type == GGML_TYPE_F32) failed`. The Gated DeltaNet graph scales the state, that CUDA operator is f32-only, and the same is true of others in the chain, so this needs an operator port rather than a flag. |
+| A higher-precision recurrence-control projection | Worse on both axes. This file quantizes the Gated DeltaNet control projections `ssm_alpha` and `ssm_beta` to Q4_K, the lowest precision it contains, and `AtomicChat/Qwen3.8-27B-GGUF` carries the same tensors at Q8_0 for 11.4 MiB more. Measured on one machine with one draft head and only the target file changed: mean accepted length 3.22 here against 2.76 there, and 32.90 tok/s against 31.37. The build with the higher-precision projections drafts half a token less per pass. |
+| A bfloat16 recurrent state | The ggml operator set requires f32. SGLang serves this model family at `--mamba-ssm-dtype bfloat16`, which halves a state slot from 153.9 to 78.4 MB, and llama.cpp fixes `GGML_TYPE_F32` at every recurrent-memory construction site. Halving the state would halve the per-verification snapshot, about 3.9% of the cycle, and the per-checkpoint cost with it. The type takes six lines to make selectable, after which the first decode aborts on `ggml-cuda/scale.cu:28: GGML_ASSERT(src0->type == GGML_TYPE_F32)`. The Gated DeltaNet graph scales the state and that operator is f32-only, as are others in the chain. |
 | DFlash drafting (`--spec-type draft-dflash`) | Ruled out on the publishers' own numbers. The flag is in the binary and DFlash is widely described as beating MTP, so it is the obvious next thing to try, but all three Qwen3.8-27B drafters published for it report acceptance below 3.01 for this MTP head. `mrchuy/Qwen3.8-27B-DFlash-drafter-bootstrap-GGUF` is Qwen3.6 weights transplanted onto the Qwen3.8 tokenizer and reaches 2.02 tokens per verification, acceptance 0.572 / 0.297 / 0.152; an A/B by its author on one target and one machine is 31.94 tok/s for DFlash against 50.70 for native MTP. `kstoyanov99/Qwen3.8-27B-Dflash` is genuinely SpecForge-trained on Qwen3.8 and measures 1.81 accepted tokens per step at 51.27% first-position acceptance. `rwmacy/qwen3.8-27b-dflash-drafter-fp8-b70` claims a mean acceptance length of 2.5 to 3.5, but it ships FP8 safetensors and no GGUF, it was fine-tuned partly on the benchmark domain it reports, and it requires a forked vLLM carrying an off-by-one fix in the DFlash readout without which acceptance collapses to about 24%. A 1.4-1.7 GiB drafter also costs far more per step on this card than the 0.611 GiB head in Table 4. Related: llama.cpp [issue #24541](https://github.com/ggml-org/llama.cpp/issues/24541) reports EAGLE3 against a `qwen3_5` hybrid target running slower than MTP despite acceptable acceptance. |
 | Raising the MMVQ warp count at verification width | Worse, and it closes the last cheap route to the MMQ admission fee. The L4 resolves to `MMVQ_PARAMETERS_GENERIC`, whose `calc_nwarps` drops from 4 warps to 2 at `ncols_dst >= 5` while the grid stays fixed by output rows, so verification at width 6 runs at half the warps of width 4. On Ada the 16-blocks-per-SM limit pins 2 warps at 66.7% occupancy where 4 warps reach 100%, which is the shape of a fix for a bandwidth-bound kernel. Built both from one commit and measured on prose, code and json: MMVQ at 2 warps gives 21.02 tok/s and at 4 warps 19.46, against the MMQ 31.38. The occupancy gain is real and is beaten by what it costs, because at 4 warps the K loop wastes more of its last trip (68 of 96 block-slots on the K=17408 matrices against 68 of 80 at 2 warps). The useful part of the result is the margin: MMVQ is 10 tok/s behind MMQ at this width, so no warp-count tuning reaches it and the admission fee needs a different kernel, not a better-configured one. |
 | Locking SM clocks | Nothing, across the whole usable range. At a fixed 72 W cap, auto / 2040 / 1800 / 1600 / 1400 / 1200 MHz give 31.14 / 31.41 / 31.22 / 31.29 / 31.35 / 31.27 tok/s, and only 1000 MHz finally breaks the tie downward at 29.65. The card is pinned at the cap at every clock above 1200 MHz, and no clock setting spends that budget better than the governor does. |
@@ -507,9 +508,26 @@ The margin is what a context costs to hold. A smaller micro-batch and a cheaper 
 | 256 | q4_0 | 139,776 |
 | 128 | q4_0 | 146,176 |
 
-q4_0 KV at `-ub 512` grants 127,488 tokens while holding a 768 MiB margin. A six-turn stress that grows the context across turns reaches 95,126 tokens with no allocation errors and 1.1 GiB free at peak. Accuracy is 40/40 at f16, q8_0 and q4_0 alike. The weights are `UD-Q4_K_XL` in every case, and the cache type is an independent choice, the one the sibling [Qwen3.6-35B-A3B box](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) already serves at q4_0.
+q4_0 KV at `-ub 512` is granted 127,488 tokens at a 768 MiB margin. Accuracy is 40/40 at f16, q8_0 and q4_0 alike, the weights are `UD-Q4_K_XL` in every case, and the cache type is an independent choice, the one the sibling [Qwen3.6-35B-A3B box](https://github.com/hanxiao/Qwen3.6-35B-A3B-MTP-L4) already serves at q4_0.
 
-The shipped configuration sets neither `-ngl` nor `--ctx-size` and asks for a margin: `--fit on --fit-target 768 --cache-type-k q4_0 --cache-type-v q4_0`. A client that needs the window should read it from `/props`, because a second copy of the number drifts from the first.
+That grant is not the usable window, because the planner sizes what it can see at load and the device keeps filling afterwards. Sampled against context depth, VRAM rises **12.25 KiB for every token resident**, linearly and independently of batch shape or checkpoint count. Filling 127,488 tokens therefore costs about 1.5 GiB beyond the load-time footprint, against the 2.0 GiB the 768 MiB margin leaves free, and a long conversation exhausts the device before it reaches its own advertised ceiling. The failure surfaces as a lazily allocated compute buffer:
+
+```
+llama_context::decode -> process_ubatch -> ggml_gallocr_alloc_graph
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 258.69 MiB on device 0: cudaMalloc failed
+```
+
+Sizing for that growth rather than against it gives the shipped configuration: `--fit-target 1792` for 81,664 tokens, which leaves about 2.1 GiB free once the window is full. Filled to depth 77,023 with prompt lengths varied across turns, it holds that margin and answers a request past the ceiling with HTTP 400 instead of aborting. `--ctx-checkpoints 4 --checkpoint-min-step 16384` bounds the recurrent-state copies a long conversation accumulates.
+
+**Table 16: what a granted context leaves free once it is full.**
+
+| `--fit-target` | Granted ctx | Free at full depth |
+| --- | --- | --- |
+| 768 MiB | 127,488 | 555 MiB |
+| 1280 MiB | 104,550 | 1,344 MiB |
+| **1792 MiB** | **81,664** | **2,134 MiB** |
+
+A client that needs the window should read it from `/props`. A second copy of the number drifts from the first.
 
 If the priority is instead the largest window with no KV quantization at all, drop `--spec-draft-model` and keep the kernel patch: that frees the 611 MiB of the draft head, measures 28.05 tok/s and fits the original 104,192.
 
@@ -517,7 +535,7 @@ If the priority is instead the largest window with no KV quantization at all, dr
 
 `scripts/verify-quality.sh` runs two independent checks against a `--spec-type none` reference: byte-level determinism and accuracy on 40 arithmetic problems with known ground truth. It captures three configurations so the kernel change and speculation can be told apart.
 
-**Table 16: quality checks.**
+**Table 17: quality checks.**
 
 | Configuration | Accuracy | Byte-identical to reference, per task |
 | --- | --- | --- |
@@ -583,9 +601,9 @@ Administrative access runs over IAP (`gcloud compute ssh --tunnel-through-iap`),
 
 ## Quantizations
 
-Table 17 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
+Table 18 lists the files available in [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). Files prefixed `UD-` use Unsloth Dynamic v3.0. Only `UD-Q4_K_XL` is measured here; the fit column compares file size against device capacity.
 
-**Table 17: quantizations and fit on a 24 GB L4.**
+**Table 18: quantizations and fit on a 24 GB L4.**
 
 | File | Size | Fit |
 | --- | --- | --- |
@@ -611,7 +629,7 @@ The draft head is tied to the model family, not to the quantization of the targe
 
 ## Cost
 
-An on-demand `g2-standard-8` costs approximately $0.81/hr and bills while the instance is RUNNING, independent of load. At 32.4 tok/s that is 144,000 tokens per dollar, against 107,000 before.
+An on-demand `g2-standard-8` costs approximately $0.81/hr and bills while the instance is RUNNING, independent of load. At 32.5 tok/s that is 144,000 tokens per dollar, against 107,000 before.
 
 ```bash
 bash scripts/teardown.sh          # stop, preserving disk and models
