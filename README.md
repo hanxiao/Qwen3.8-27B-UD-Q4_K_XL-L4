@@ -462,6 +462,10 @@ Measured and rejected, so they need not be tried again.
 | Drafting deeper than 5 | Accepted length rises and throughput does not. At `p-min 0` the depths 5 / 6 / 7 / 8 / 9 give accepted length 3.22 / 3.26 / 3.49 / 3.38 / 3.38 for 32.63 / 31.90 / 31.41 / 29.29 / 28.75 tok/s. Depth 7 drafts 8.4% more accepted tokens per pass and still loses, because each extra draft step is a full draft-model forward and the verification batch widens past the point where the kernel routing below stays free. |
 | Kernel routing held fixed across draft depth | The per-quant-type routing in Table 4 is tuned for one verification width and does not survive a change of depth. MMQ tiles 8 columns at a time, so widths 2 to 8 cost the same on the tensors routed to it, while MMVQ cost grows per column, and `GGML_MMVQ_MAX_Q6K=8` with `GGML_MMVQ_MAX_IQ4XS=8` puts 23% of the weights on MMVQ. At depth 7 the verification batch is 8 wide and that 23% is paying linearly for it: forcing both types onto MMQ recovers 31.41 to 32.52 and lifts the worst of the seven workloads from 24.84 to 26.42. The crossover runs the other way at depth 5, where the same all-MMQ setting gives 32.37 against 32.63. Neither combination beats the shipped one, and the run-to-run spread on this benchmark is about 0.3 tok/s, so depth 7 on MMQ is a tie rather than a win. |
 | `--spec-draft-p-min` above 0 with the native head | Worse at every depth tried. At depth 7 on MMQ, `p-min` 0.0 / 0.05 / 0.10 / 0.20 gives 32.52 / 32.36 / 29.92 / 28.29, and at depth 5 `p-min 0.10` gives 31.27 against 32.63. Stopping a draft early saves less than the drafts it abandons were worth. |
+| Giving the block drafter its own output head | Worse, and the reason separates it from the native head. The drafter ships no `output.weight`, so `src/models/dflash.cpp` leaves `output` null and every draft round re-reads the target `Q6_K` head, 994.6 MiB. Grafting the `q2_K` full-vocabulary head from the sidecar onto it, which saves 596.7 MiB per round and needs no `d2t` because the vocabulary is unreduced, gives 35.34 tok/s against 35.88 and accepted length 3.40 against 3.52. The same trick raised accepted length on the native head, where the draft output only has to pick one token. This drafter runs a top-k over those logits and traces a candidate path through them, so the logits are structural and `q2_K` noise costs more ranking accuracy than the bandwidth buys. |
+| Per-quant kernel routing under the block drafter | Worse both ways, and by more than under the native head. At verification width 8 with the target output head read twice per cycle, all types on MMQ gives 36.01 and 35.93 against 34.94 for `Q6_K` on MMVQ and 34.86 for `IQ4_XS` on MMVQ. The routing in Table 4 is tuned for a narrower width and does not survive the move. |
+| `--spec-draft-n-max` above 7 with the block drafter | Nothing, and it is not free. `dflash.block_size` is 8 and `n_draft_max` is `block_size - 1`, so the value is clamped to 7 with a warning. The clamp mutates a copy, while `need_n_rs_seq()` sizes the target recurrent state from the raw value, so `n-max 8` and `n-max 9` draft exactly 7 tokens and spend 299 and 598 MiB of VRAM for it. |
+| `--spec-draft-p-min` with the block drafter | Inert. The DFlash 2 branch returns before the confidence gate is reached, so the value is never read. The block is drafted in full every round. |
 | `GGML_CUDA_DISABLE_GRAPHS=1`, `--cache-ram 0`, `--ctx-checkpoints 0` | Controls. Disabling CUDA graphs costs 1.8% (32.02 against 32.61 on the shipped configuration, and 2.3% on an earlier one), with mean accepted length unchanged at 3.22, so graph capture is already working, and neither the prompt cache nor context checkpointing costs anything measurable. |
 
 Forward-pass cost must be measured through speculative decoding. Timing prompt processing instead shows a 3.3x step between width 4 and width 5 that does not exist in the decode path, because prompt processing and speculative verification take different paths through the server.
@@ -853,6 +857,61 @@ from the chain-drafting PR the native-head configuration is built on. Chain draf
 one-decode optimization for sequential drafting, so a block drafter has nothing to gain from it, and
 the two do not need to be combined. `patches/0001-mmvq-runtime-crossover.patch` applies to that
 branch unchanged.
+
+## Long-horizon behaviour and the context ceiling
+
+The seven-workload benchmark runs 256-token generations from short prompts. The deployment does not:
+it runs one growing conversation at 80k or more tokens with heavy prefix reuse. Those two regimes
+disagree, and the block drafter changes the answer on both.
+
+Measured by growing a single conversation turn by turn, each turn reusing the whole prefix, at the
+window the memory planner grants for a 1,024 MiB margin:
+
+| Turn | Context | Decode tok/s | Accepted length | Prefill tok/s | Prefix cached | VRAM MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 21,963 | 34.12 | 3.76 | 554.5 | 0% | 23,786 |
+| 2 | 43,696 | 33.13 | 4.09 | 414.2 | 50.0% | 23,786 |
+| 3 | 65,429 | 27.93 | 3.76 | 334.4 | 66.7% | 23,786 |
+| 4 | 87,162 | 29.76 | 4.36 | 279.9 | 75.0% | 23,786 |
+| 5 | 108,895 | 29.10 | 4.57 | 240.5 | 80.0% | 23,786 |
+| 6 | 130,628 | 26.35 | 4.47 | 210.9 | 83.3% | 23,786 |
+| 7 | 152,361 | 22.17 | 4.00 | 187.3 | 85.7% | 23,786 |
+| 8 | 174,094 | 20.29 | 3.92 | 168.7 | 87.5% | 23,786 |
+
+Two things in that table are worth more than the throughput column. Accepted length **rises** with
+depth, from 3.76 to 4.57, so long-horizon work speculates better than the benchmark suggests and the
+drafter is worth more in the deployment than on the bench. And VRAM is **flat** at every depth. The
+configuration this repository previously served grew 12.25 KiB per token of depth and aborted on a
+graph buffer allocation; this one does not move. A twenty-case shape battery, walking prompt lengths
+across many final-ubatch remainders, passes 20 of 20 at the same window, and the server log records
+zero allocation or graph failures across the whole run. Turn 9 is refused with a 400 because it would
+exceed the window, which is the correct behaviour rather than a failure.
+
+The context gain is the drafter, not the build. Measured on one binary, changing only the drafter:
+
+| Drafter, `--fit-target 1792`, `-ub 512` | Granted context | VRAM MiB |
+| --- | --- | --- |
+| Native nextn head, `n-max 5` | 81,664 | 21,422 |
+| DFlash 2, `n-max 7` | 155,136 | 22,798 |
+| DFlash 2, `n-max 7`, `-ub 256` | 160,768 | 22,532 |
+| DFlash 2, `n-max 5` | 182,016 | 23,102 |
+
+The native head reproduces exactly the window this repository served before, so the comparison is
+clean. Its draft context carries a KV cache that scales with the target context; the block drafter's
+does not, and that is where the window comes from. Lowering `n-max` buys more still, because
+`n_rs_seq` sizes the target's Gated DeltaNet state snapshots at 149.63 MiB per row, but it costs
+throughput, so `n-max 7` is kept.
+
+| Margin | `-ub` | Granted context |
+| --- | --- | --- |
+| 1792 | 512 | 155,136 |
+| 1792 | 256 | 160,768 |
+| 1024 | 512 | 189,696 |
+| 768 | 512 | 200,960 |
+| 768 | 256 | 207,360 |
+
+`--fit-target 1792` is kept. 155,136 tokens leaves 1.7 GiB of headroom, and the larger windows are
+validated but spend the margin that the previous configuration needed after two production aborts.
 
 ## Files
 
