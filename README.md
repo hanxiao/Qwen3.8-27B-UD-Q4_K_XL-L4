@@ -5,7 +5,7 @@
 | Model | Qwen3.8-27B, [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), the 2026-08-19 rebuild, 17,559,178,144 bytes |
 | Weights | `UD-Q4_K_XL`, 16.35 GiB on disk, 15.35 GiB read per forward pass |
 | KV cache | `q4_0`, 18 KiB per token across the 16 full-attention layers |
-| Context | **173,568 tokens**, planned by `--fit-target 1792`, not pinned |
+| Context | **226,048 tokens**, planned by `--fit-target 768 -ub 256`, not pinned |
 | Decode, prose | **40.0 tok/s** |
 | Decode, seven workloads | **37.7 tok/s** at the full window, 38.3 at a 32k window (math 48.7, code 28.5) |
 | Prefill | **556 tok/s** at a 22k prompt, 281 at 87k, 188 at 152k |
@@ -14,8 +14,8 @@
 | Kernel routing | `GGML_MMVQ_MAX=2`, all types on MMQ |
 | Build | llama.cpp [PR #27342](https://github.com/ggml-org/llama.cpp/pull/27342) plus `patches/0001` |
 | Checkpoints | `--ctx-checkpoints 4 --checkpoint-min-step 16384` |
-| Batching | `-ub 512 -b 2048`, `--parallel 1` |
-| GPU | NVIDIA L4 24 GB, ECC off, 72 W cap, 22.8 of 24.0 GiB resident |
+| Batching | `-ub 256 -b 2048`, `--parallel 1` |
+| GPU | NVIDIA L4 24 GB, ECC off, 72 W cap, 23.0 of 24.0 GiB resident |
 | Quality | 40/40 on the arithmetic set, unchanged against `--spec-type none` |
 
 Decode is the seven-workload benchmark, four repetitions, alternated against a control; the run-to-run spread is about 0.4 tok/s. Prefill and the accepted length at depth come from growing a single conversation to 152,361 tokens with the prefix reused, which is the shape the deployment serves. Accepted length is reported per target forward pass, so 3.63 means one verification emits 3.63 tokens.
@@ -210,9 +210,9 @@ Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2,
 ## Serving configuration
 
 ```
---parallel 1 --flash-attn on --fit on --fit-target 1792
+--parallel 1 --flash-attn on --fit on --fit-target 768
 --ctx-checkpoints 4 --checkpoint-min-step 16384
--ub 512 -b 2048 --cache-type-k q4_0 --cache-type-v q4_0 --no-mmap --threads 8
+-ub 256 -b 2048 --cache-type-k q4_0 --cache-type-v q4_0 --no-mmap --threads 8
 --spec-type draft-dflash
 --spec-draft-model /opt/models/dflash2-q4km.gguf --spec-draft-ngl 99
 --spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.0
