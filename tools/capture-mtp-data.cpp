@@ -7,10 +7,16 @@
 // difference between hours and days.
 //
 // Per position we record what the head must learn to reproduce:
+//   tok      the input token at this position                       int32
 //   h        the hidden state that will be fed to the head          [n_embd] bf16
 //   argmax   the target's own committed token, which IS the accept  int32
 //            criterion at inference time, so it is the label
 //   topk     top-K (id, logit) for distribution distillation        K*(int32,float)
+//
+// The input token is recorded because the head is not a function of h alone: it consumes the
+// hidden state at i together with the embedding of the token at i+1, and predicts the token at
+// i+2. Reconstructing that sequence by re-tokenizing the corpus afterwards has to reproduce the
+// chunking and the BOS handling exactly, so the ids are written here instead.
 //
 // Usage: capture-mtp-data -m model.gguf -f corpus.txt -o out.bin [-k 8] [-c 8192] [-n MAX_TOK]
 #include "llama.h"
@@ -87,7 +93,9 @@ int main(int argc, char ** argv) {
     FILE * of = fopen(out_path.c_str(), "wb");
     if (!of) { fprintf(stderr, "cannot open %s for writing\n", out_path.c_str()); return 1; }
     // header: magic, n_embd, topk, n_positions (patched at the end)
-    const char magic[8] = "MTPCAP1";
+    // MTPCAP2 adds the input token id ahead of the hidden state; a reader must not accept
+    // a v1 file as if it were this layout.
+    const char magic[8] = "MTPCAP2";
     int32_t hdr[3] = { n_embd, topk, 0 };
     fwrite(magic, 1, 8, of); fwrite(hdr, sizeof(int32_t), 3, of);
 
@@ -128,6 +136,8 @@ int main(int argc, char ** argv) {
             for (int t = 0; t < topk; t++) { kid[t] = idx[t]; kval[t] = lg[idx[t]]; }
 
             const int32_t argmax = kid[0];   // the accept criterion, and so the label
+            const int32_t tok_in = toks[off + i];
+            fwrite(&tok_in,     sizeof(int32_t), 1, of);
             fwrite(hbuf.data(), sizeof(uint16_t), n_embd, of);
             fwrite(&argmax,     sizeof(int32_t), 1, of);
             fwrite(kid.data(),  sizeof(int32_t), topk, of);
