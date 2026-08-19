@@ -715,6 +715,42 @@ The diagnostic that isolated it is worth reusing on any ported block: trace
 Top-1 is flat at 66 to 69% across causal warmup depths of 32 through 1,536, so the gap to the
 production figure is workload mix, not truncated context.
 
+## Draft head training
+
+The throughput ceiling section identifies accepted length as the one lever left, so the head was
+trained. `tools/train_nextn_head.py` does it: it reads captured target hidden states, and the label
+is the target argmax at the next position, because acceptance is the head emitting what the target
+would emit. Restricting the loss to the captured top-8 ids removes the 248,320-wide `lm_head` from
+the backward pass, which brings one epoch over 3M positions down to seven minutes on the L4.
+
+Training works, and it does not transfer. Four heads were trained on a 9,324-document, 4.5M-token
+calibration corpus and each was measured on the seven-workload bench, which the training corpus does
+not overlap.
+
+| Head | Held-out top-1, training corpus | Bench tok/s | Accepted length |
+| --- | --- | --- | --- |
+| Qwen released head | 50.20% | 32.61 | 3.22 |
+| Fine-tuned, lr 3e-6, 292 steps | 64.05% | 31.76 | 3.18 |
+| Fine-tuned, lr 2e-5, anchored to the released weights | 71.83% | 30.38 | 3.02 |
+| Fine-tuned, lr 2e-5, 1,464 steps | 72.31% | 29.49 | 2.89 |
+
+The relationship is monotone: every point gained on the training corpus costs throughput on the
+bench. Learning rate and an anchor penalty move a head along that line rather than off it, so
+neither is the lever. The corpus is. A head trained this way generalizes across documents inside its
+own corpus, gaining 22 points on a disjoint tail, and still loses 0.33 of accepted length everywhere
+else, which is the signature of domain shift rather than memorization.
+
+One structural gap remains open and is implemented but unmeasured. Teacher forcing only ever shows
+the head the target hidden state, while `common/speculative.cpp` feeds the head its own pre-norm
+state forward through `llama_get_embeddings_nextn_ith` for draft positions 1 and beyond. Measured
+per-position acceptance is 0.78, 0.55, 0.35, 0.25, 0.18, so almost all of the accepted length is
+lost in that decay, and teacher forcing never trains it. The trainer unrolls K steps and feeds the
+pre-norm state forward to match the drafter. Feeding the true token at each step is correct, because
+acceptance at position k is conditional on positions 0 through k-1 already matching.
+
+Beating a head the model authors trained needs training data at least as broad as theirs. That is
+the constraint on this path, and it is a data problem, not a method or a serving problem.
+
 ## Files
 
 | Path | Purpose |
@@ -730,6 +766,7 @@ production figure is workload mix, not truncated context.
 | `tools/bandwidth-probe.cu` | measure achievable DRAM bandwidth; used to separate the power tax from kernel slack |
 | `tools/capture-mtp-data.cpp` | capture MTP draft-head training data at prefill speed, for the drafter project the ceiling analysis points to |
 | `tools/mtp_head_reference.py` | torch forward pass for the nextn draft head, matching `src/models/qwen35.cpp` |
+| `tools/train_nextn_head.py` | fine-tune the draft head on captured hidden states, unrolled K steps |
 | `scripts/start.sh` | restart a stopped instance, retrying through STOCKOUT |
 | `scripts/teardown.sh` | stop or delete |
 
