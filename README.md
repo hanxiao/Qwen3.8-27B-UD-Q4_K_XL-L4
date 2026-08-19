@@ -801,6 +801,59 @@ MMVQ is worth 9% on the math workload, and under adaptive depth the same setting
 code workload. Holding all types on MMQ is worth more than the routing it gives up, so the two
 settings ship together.
 
+## A block-diffusion drafter
+
+The ceiling analysis says accepted length is the only lever with enough leverage left, and that a
+better drafter is a training project. Someone else did that training.
+[DFlash 2](https://inco.ai/blog/dflash2/) is a block-diffusion drafter published for this exact
+target: it predicts a whole block in one pass rather than one token per pass, keeps candidates at
+every position, and traces a path through them with a small selector. Decoding is lossless.
+
+Two properties matter on this card. One pass per block replaces the five to seven sequential draft
+forwards that cost 8.3 ms of a 98.8 ms cycle, and the accepted length is far higher than the native
+nextn head reaches. Both act on the two terms the cost model says are worth attacking.
+
+| Drafter, both on the same binary | Seven workloads | Worst workload | GSM8K-shaped accepted length |
+| --- | --- | --- | --- |
+| Native nextn head, depth 5 | 31.30 tok/s | 23.31 | 4.123 |
+| DFlash 2 `Q4_K_M`, `n-max 7` | **35.99 tok/s** | 28.12 | **5.573** |
+
+Against the configuration this repository previously measured as best, every workload gains except
+json:
+
+| Workload | Native head, depth 5 | DFlash 2, `n-max 7` |
+| --- | --- | --- |
+| prose | 34.94 | 36.83 |
+| code | 24.54 | 31.13 |
+| json | 32.95 | 32.09 |
+| chat | 26.74 | 28.12 |
+| math | 43.19 | 48.14 |
+| multi | 32.02 | 39.75 |
+| summ | 33.65 | 35.83 |
+| **mean** | **32.58** | **35.99** |
+| **worst** | **24.54** | **28.12** |
+| GSM8K-shaped | 42.83 | 55.34 |
+
+Three independent runs give 35.92, 36.01 and 35.99, against a run-to-run spread of about 0.4, and
+accuracy is 40/40. The published accepted length for this drafter is 5.39 on the first eight GSM8K
+examples against a `Q4_K_M` target; against the `UD-Q4_K_XL` target here it measures 5.573, so it
+transfers rather than depending on the target quantization it was evaluated on.
+
+Settings, each measured rather than assumed:
+
+| Setting | Value | Against the alternative |
+| --- | --- | --- |
+| Draft quantization | `Q4_K_M`, 1.14 GiB | 35.99 against 35.39 for `Q8_0`, which agrees with the publisher's own ordering |
+| `--spec-draft-n-max` | 7 | 35.99 against 34.76 at 5 and 35.86 at 8. The block caps at 7, so 9 returns the identical accepted length |
+| Kernel routing | all types on MMQ | 36.01 against 34.57 for the per-quant routing, which is tuned for a narrower verification width |
+| `-ub` | 512 | 35.89 at 256, no difference |
+
+It needs [PR #27342](https://github.com/ggml-org/llama.cpp/pull/27342), which is a different branch
+from the chain-drafting PR the native-head configuration is built on. Chain drafting is a
+one-decode optimization for sequential drafting, so a block drafter has nothing to gain from it, and
+the two do not need to be combined. `patches/0001-mmvq-runtime-crossover.patch` applies to that
+branch unchanged.
+
 ## Files
 
 | Path | Purpose |
