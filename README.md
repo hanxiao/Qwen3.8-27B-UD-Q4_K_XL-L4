@@ -936,25 +936,48 @@ The context gain is the drafter, not the build. Measured on one binary, changing
 | --- | --- | --- |
 | Native nextn head, `n-max 5` | 81,664 | 21,422 |
 | DFlash 2, `n-max 7` | 155,136 | 22,798 |
-| DFlash 2, `n-max 7`, `-ub 256` | 160,768 | 22,532 |
-| DFlash 2, `n-max 5` | 182,016 | 23,102 |
 
 The native head reproduces exactly the window this repository served before, so the comparison is
 clean. Its draft context carries a KV cache that scales with the target context; the block drafter's
-does not, and that is where the window comes from. Lowering `n-max` buys more still, because
-`n_rs_seq` sizes the target's Gated DeltaNet state snapshots at 149.63 MiB per row, but it costs
-throughput, so `n-max 7` is kept.
+does not, and that is where the window comes from.
 
-| Margin | `-ub` | Granted context |
-| --- | --- | --- |
-| 1792 | 512 | 155,136 |
-| 1792 | 256 | 160,768 |
-| 1024 | 512 | 189,696 |
-| 768 | 512 | 200,960 |
-| 768 | 256 | 207,360 |
+### Sweeping the ceiling
 
-`--fit-target 1792` is kept. 155,136 tokens leaves 1.7 GiB of headroom, and the larger windows are
-validated but spend the margin that the previous configuration needed after two production aborts.
+The planner grants a window from the margin it is told to leave. Granted is not the same as usable,
+so every candidate below was put through a twenty-case shape battery, which walks prompt lengths
+across many final-ubatch remainders, and then a deep fill that grows one conversation toward the
+ceiling. Both are necessary. The 249,600 window loads cleanly, reports itself healthy, and then fails
+every one of the twenty shapes with a hundred allocation failures.
+
+**Table 19: granted and usable context, on the rebuilt weights with the block drafter.**
+
+| `--fit-target` | `-ub` | Granted | Free at idle (MiB) | Shape battery | Deep fill | Allocation failures |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1792 | 512 | 173,568 | 1,768 | 20/20 | 152,361 | 0 |
+| 1536 | 512 | 185,088 | 1,508 | | | |
+| 1280 | 512 | 196,352 | 1,256 | | | |
+| 1024 | 512 | 207,872 | 998 | | | |
+| 768 | 512 | 219,392 | 738 | 20/20 | 185,485 | 0 |
+| 640 | 512 | 225,024 | 610 | **2/20** | | 2 |
+| 512 | 512 | fails to load | | | | |
+| 1792 | 256 | 179,456 | 2,036 | | | |
+| 1024 | 256 | 214,528 | 1,266 | | | |
+| **768** | **256** | **226,048** | **1,014** | **20/20** | **222,536** | **0** |
+| 512 | 256 | 237,824 | 754 | 20/20 | 222,536 | 0 |
+| 256 | 256 | 249,600 | 496 | **0/20** | fails turn 1 | 100 |
+
+`-ub 256` is what makes the large windows usable, not the margin. At `-ub 512` the ceiling breaks
+between 219,392 and 225,024, while at `-ub 256` it survives to 237,824 on a smaller margin, because
+the compute buffers a graph instantiation has to find room for are half the size. It costs 1.7% of
+prefill and nothing measurable in decode.
+
+The shipped window is **226,048** at `--fit-target 768 -ub 256`. 237,824 passes the same checks and
+is 5% larger, and it is not taken: it leaves 754 MiB at idle and 564 MiB during a deep prefill,
+against 1,014 and 824 for the shipped one, and both reached the same depth. A context ceiling on this
+card has aborted production twice, and the margin is what the second abort was spent buying back.
+
+For reference at `q8_0` KV, which is a different axis from the weight floor: 102,144 at a 1792
+margin and 129,024 at 768. `q4_0` KV is the better trade on both throughput and window.
 
 ## The 2026-08-19 rebuild of the weights
 
