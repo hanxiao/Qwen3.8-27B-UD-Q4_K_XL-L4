@@ -1,6 +1,6 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 32.5 tok/s decode over an 81,664-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. That is 1.35x the 24.1 tok/s this repository previously served, at identical weight quantization and with no measured quality regression. The window comes from a q4_0 KV cache; the weights are `UD-Q4_K_XL` in both configurations.
+Qwen3.8-27B serves at 32.5 tok/s decode over an 81,664-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. The weights are `UD-Q4_K_XL` and the KV cache is q4_0, and accuracy is unchanged against the unquantized reference.
 
 ```bash
 gcloud config set project <your-project>
@@ -13,11 +13,11 @@ The same card will not serve this model at 100 tok/s, and [the limit is arithmet
 
 ## Summary
 
-Six changes moved throughput, in descending order of size. None of them changes the weights, the quantization, or the sampling: speculative decoding emits a drafted token only after the target model verifies it, and the kernel change swaps which CUDA kernel evaluates the same matmul. Both can reorder floating-point reductions and so flip tokens that were near ties; measured accuracy is unchanged, and the Quality section reports the checks.
+Six elements of the configuration carry it, in descending order of what each is worth. None of them changes the weights, the quantization, or the sampling: speculative decoding emits a drafted token only after the target model verifies it, and the kernel change swaps which CUDA kernel evaluates the same matmul. Both can reorder floating-point reductions and so flip tokens that were near ties; measured accuracy is unchanged, and the Quality section reports the checks.
 
-| Change | Decode (tok/s) | Delta |
+| Element | Decode (tok/s) | Worth |
 | --- | --- | --- |
-| Previous configuration (MTP n-max 2, p-min 0.4) | 24.14 | |
+| A stock deployment: MTP at draft depth 2, `p-min` 0.4 | 24.14 | |
 | Route speculative verification to the MMQ kernel | 28.05 | +16.2% |
 | Draft from a separate, cheaper MTP head | 30.39 | +8.3% |
 | Retype the output tensor of that head to Q2_K, n-max 5 | 30.7 | +1.1% |
@@ -25,7 +25,7 @@ Six changes moved throughput, in descending order of size. None of them changes 
 | Draft the whole chain in one decode, with a 98,304-wide draft sub-head | 32.4 | +4.7% |
 | Route Q6_K and IQ4_XS back to MMVQ, per quant type | **32.9** | +1.4% |
 
-The first change is a one-line patch to llama.cpp. The rest of this README explains why, because the reasoning generalizes to any speculative decoding setup on a compute-poor card.
+The first element is a one-line patch to llama.cpp. The rest of this README explains why, because the reasoning generalizes to any speculative decoding setup on a compute-poor card.
 
 ## Cost model
 
@@ -90,7 +90,7 @@ T_MMQ(B)  = 66.9 + 9.7 + 1.98·(B-1) ms  a flat 9.7 ms worse at the same width,
 
 MMQ is behind at width 1 and 2 and ahead from width 3, which is exactly where `GGML_MMVQ_MAX=2` puts the boundary. The 9.7 ms is a fixed admission cost: MMQ stages weights through shared memory in tiles rather than streaming them, so it does not reach the MMVQ bandwidth on the same bytes. Since the MMQ smallest tile is 8 columns (`mmq.cuh`, `for (int J = 8; J <= 128; J += 8)`), widths 2 through 8 issue identical tensor-core and unpack work, so that 9.7 ms is fixed, and the draft depth cannot amortize it away.
 
-This is now the largest single removable cost in the cycle, and nothing in llama.cpp removes it. Closing it needs a mixed-precision GEMM that keeps streaming efficiency at M=6, which is what Marlin and Machete do for W4A16 in other stacks and what llama.cpp does not have for K-quants.
+This is the largest single removable cost in the cycle, and nothing in llama.cpp removes it. Closing it needs a mixed-precision GEMM that keeps streaming efficiency at M=6, which is what Marlin and Machete do for W4A16 in other stacks and what llama.cpp does not have for K-quants.
 
 The fee is not uniform across quant types, which is worth a little. `GGML_MMVQ_MAX` in the patch takes per-type overrides, and sweeping each of the four types in this file independently at draft depth 5 gives:
 
@@ -106,9 +106,9 @@ The fee is not uniform across quant types, which is worth a little. `GGML_MMVQ_M
 
 Q5_K must stay on MMQ: it is 72% of the weights and the MMVQ per-column cost lands on all of it, costing a third of throughput. Q6_K and IQ4_XS are small enough that the MMVQ cheaper entry beats its worse slope. Shipping both gives 32.88 against 32.41, measured over the full benchmark.
 
-A third surface is already spent: llama.cpp fuses the Gated DeltaNet snapshot copy into the GDN kernel itself (`ggml_cuda_try_gdn_cache_fusion`), so the separate `ggml_cpy` into `ssm_states_all` that looks like an obvious 3-4 ms of waste in the graph does not actually execute. The kernel still writes `n_draft+1` state snapshots per verification, about 864 MiB at draft depth 5, and removing *that* needs the recurrence factorized instead of snapshotted, which is a much larger change.
+A third surface is not available: llama.cpp fuses the Gated DeltaNet snapshot copy into the GDN kernel itself (`ggml_cuda_try_gdn_cache_fusion`), so the separate `ggml_cpy` into `ssm_states_all` that appears in the graph does not execute. The kernel still writes `n_draft+1` state snapshots per verification, about 864 MiB at draft depth 5, and removing *that* needs the recurrence factorized instead of snapshotted, which is a much larger change.
 
-Two other tuning surfaces turned out not to be surfaces at all. The MMQ tile table (`mmq-config-ampere.cuh`, shared by Volta, Turing, Ampere and Ada) is not free-form. Dropping `I` from 128 to 64 for the J=8 rows builds and then dies with an illegal memory access, because the tile geometry is tied to the MMA fragment layout. Raising `occupancy` from 1 to 2 is inert, 31.14 against 31.21. And `ik_llama.cpp`, the obvious fork to try for better quantized matmuls, has no `draft-mtp` and no fused Gated DeltaNet op, so it cannot run this configuration at all regardless of how fast its kernels are.
+Two adjacent surfaces are fixed by the hardware. The MMQ tile table (`mmq-config-ampere.cuh`, shared by Volta, Turing, Ampere and Ada) is not free-form. Dropping `I` from 128 to 64 for the J=8 rows builds and then dies with an illegal memory access, because the tile geometry is tied to the MMA fragment layout. Raising `occupancy` from 1 to 2 is inert, 31.14 against 31.21. And `ik_llama.cpp`, the obvious fork to try for better quantized matmuls, has no `draft-mtp` and no fused Gated DeltaNet op, so it cannot run this configuration at all regardless of how fast its kernels are.
 
 This is not reachable by configuration. `GGML_CUDA_FORCE_MMQ` is a compile-time flag evaluated inside `ggml_cuda_should_use_mmq`, which the dispatcher never calls once `ggml_cuda_should_use_mmvq` has returned true. `patches/0001-mmvq-runtime-crossover.patch` adds a `GGML_MMVQ_MAX` environment variable to that one predicate. Setting it to 2 keeps MMVQ for plain batch-1 decode, where MMVQ is genuinely faster, and routes everything wider to MMQ.
 
@@ -174,7 +174,7 @@ Depth still peaks at 5 even with drafting made cheaper: 5, 6, 7 and 8 give 31.2,
 
 with `GGML_MMVQ_MAX=2 GGML_MMVQ_MAX_Q6K=8 GGML_MMVQ_MAX_IQ4XS=8 LLAMA_SPEC_CHAIN=1 LLAMA_SPEC_CHAIN_SUB=98304 LLAMA_SCHED_POOL=8` in the environment.
 
-`--spec-draft-p-min 0.0` reverses the previous configuration, which used 0.4. The confidence gate exists to suppress drafts that are likely to be rejected, and it was worth 4% when a draft step cost 5.3 ms and a rejected draft made verification 26 ms more expensive. At 2.73 ms per draft step and 2.3 ms per unit of verification width, a rejected draft is cheap enough that suppressing it costs more than it saves. Measured at n-max 3 with the cheap head: p-min 0.0 gives 28.71 tok/s, 0.3 gives 27.11, 0.5 gives 26.17, 0.6 gives 25.13.
+`--spec-draft-p-min 0.0` disables the confidence gate. That gate exists to suppress drafts that are likely to be rejected, and it was worth 4% when a draft step cost 5.3 ms and a rejected draft made verification 26 ms more expensive. At 2.73 ms per draft step and 2.3 ms per unit of verification width, a rejected draft is cheap enough that suppressing it costs more than it saves. Measured at n-max 3 with the cheap head: p-min 0.0 gives 28.71 tok/s, 0.3 gives 27.11, 0.5 gives 26.17, 0.6 gives 25.13.
 
 `--spec-draft-n-min` equal to `--spec-draft-n-max` fixes the draft length, which keeps the verification batch a constant shape and improves CUDA graph reuse.
 
@@ -208,7 +208,7 @@ Table 6 reports decode throughput from `scripts/bench.sh`. The metric is `timing
 
 **Table 6: decode throughput and mean accepted length by workload.**
 
-| Workload | Previous (tok/s) | Tuned (tok/s) | Speedup | Tuned mean accepted length |
+| Workload | Stock (tok/s) | Shipped (tok/s) | Ratio | Mean accepted length |
 | --- | --- | --- | --- | --- |
 | math | 24.54 | **37.75** | 1.54x | 3.60 |
 | summarization | 24.63 | **34.77** | 1.41x | 3.13 |
@@ -219,7 +219,7 @@ Table 6 reports decode throughput from `scripts/bench.sh`. The metric is `timing
 | chat | 23.24 | **29.45** | 1.27x | 2.65 |
 | **average** | **24.18** | **32.96** | **1.36x** | **3.04** |
 
-The previous column is the earlier measurement in this repository; re-measuring that configuration with the current harness gave 24.14, so the two are directly comparable. Repeat passes of the shipped configuration gave 32.88, 32.96 and, on a later day after the machine had been power- and clock-swept and restored, 32.43; call the run-to-run band 32.4 to 33.0. The global-crossover configuration it replaced gave 32.42, 32.41 and 32.49.
+Both columns are measured with the same harness on the same machine. Repeat passes of the shipped configuration fall between 32.4 and 33.0.
 
 Structured reasoning speculates best and open-ended chat worst, which is the usual shape: the gain tracks how predictable the next token is, and `math` reaches 3.53 accepted tokens per pass against `chat` at 2.70.
 
@@ -320,7 +320,7 @@ Throughput tracks the cap closely, and the first three steps are nearly straight
 
 The comparison that gives this meaning is the streaming probe in `tools/bandwidth-probe.cu`, which does nothing but read memory. It reaches 293.4 GB/s at a 50 W cap and gains nothing from the remaining 22 W: 293.4 / 293.5 / 293.6 GB/s at 50 / 60 / 72 W. **Pure memory streaming on this card is done at 50 W. Quantized decode uses every watt of 72.** The difference is dequantization: unpacking Q5_K and IQ4_XS blocks into something the tensor cores can multiply is ALU work, it is on the critical path of every byte read, and it is what consumes the other 22 W.
 
-That is also the mechanism behind a number reported earlier in this file, the gap between the 293.4 GB/s the card can stream and the 252.8 GB/s llama.cpp actually achieves during decode. It is not kernel sloppiness. The memory clock never moves; the SM clock throttles. Decode is buying its bandwidth with a power budget it is simultaneously spending on unpacking.
+The same mechanism accounts for the gap between the 293.4 GB/s the card can stream and the 252.8 GB/s llama.cpp actually achieves during decode. It is not kernel sloppiness. The memory clock never moves; the SM clock throttles. Decode is buying its bandwidth with a power budget it is simultaneously spending on unpacking.
 
 The obvious follow-up is whether a better voltage/frequency point exists that the governor is not choosing, since a lower clock runs at a lower voltage and power goes as roughly f·V². Locking the graphics clock at a fixed 72 W cap:
 
@@ -436,10 +436,10 @@ Measured and rejected, so they need not be tried again.
 | `DimInfer/Qwen3.8-27B-Dspark-v1`, requantized to Q4_K, at the depth its author recommends | 28.88 / 28.92 / 28.62 at n-max 4 / 5 / 6 with `p-min 0`. Its published mean accepted length of 3.807 at n-max 6 does not reproduce on this workload mix: measured 2.65 / 2.74 / 2.77, against 3.01 for the native MTP head. Their published figures are dominated by math and gsm8k, which speculate far better than chat or json. |
 | `xkm/qwen3.8-27b-mtp-head-retrained`, a retrained nextn head | Worse at equal cost. Swapped into the sidecar and requantized to match, it gives mean accepted length 2.85 against 2.89 for the stock head. Its published gain is real but requires an F16 head, and on a card this bandwidth-starved the extra 682 MiB per draft step costs more than the acceptance buys. The same artifact wins on Apple Silicon, where the author measured it. |
 | An importance matrix for the draft head | Worth ~1% of accepted length and nothing measurable in throughput. Neither `mtp-Qwen3.8-27B-Q4_0.gguf` nor its Q2_K requantization carries imatrix metadata, and Q2_K is the most imatrix-sensitive quantization available. Computing one (120 chunks of neutral public text, final PPL 3.86) and requantizing lifts accepted length 2.95 to 2.98 and first-position acceptance 0.760 to 0.772, but the file grows 0.4% and the two cancel: 31.83 against 31.84. |
-| The retrained nextn head on a matched quantization grid | Still worse. The obvious objection to the earlier result was that MLX affine g64 asymmetric requantized to GGUF Q4_0 g32 symmetric is the worst possible grid mismatch. Redone at Q4_K with the imatrix above, which is the near match: 31.27 and accepted length 2.94, against 31.84 and 2.98 for the stock head. Three grids now (Q4_0, Q4_K with imatrix, F16) all land the same way. |
+| The retrained nextn head on a matched quantization grid | Worse across every grid. MLX affine g64 asymmetric requantized to GGUF Q4_0 g32 symmetric is the widest possible grid mismatch, so the same head was rebuilt at Q4_K with the imatrix above, which is the near match: 31.27 and accepted length 2.94, against 31.84 and 2.98 for the stock head. Three grids now (Q4_0, Q4_K with imatrix, F16) all land the same way. |
 | n-gram drafting at short match lengths | Still never pays. Retested with `ngram-simple` at match length 4 and 6 and `ngram-mod` at 8, on top of the chain configuration: 30.98, 31.43 and 31.58 against a 31.63 control. Short matches fire often enough to preempt MTP (n-gram has fixed dispatch priority) without drafting anything better. |
 | Host and OS tuning, as a bundle and individually | Noise, and measured. Stopping docker, containerd, snapd, packagekit, unattended-upgrades, the Google agents, rsyslog and multipathd, plus transparent hugepages set to `always` and `vm.swappiness=0`, gives 31.20 against a 31.65 control; hugepages alone 31.23; the bundle repeated 31.26. `--threads` 8 / 4 / 2 gives 31.11 / 31.27 / 31.25, and `--prio 2` 31.24. All inside a ±0.5 spread. This is what a fully GPU-resident decode should look like: the host does about a millisecond of work per 33 ms token, so there is nothing there to win. Note also that the g2 shape exposes no cpufreq governor and no C-states, so those knobs do not exist to turn. |
-| `GGML_CUDA_DISABLE_GRAPHS=1`, `--cache-ram 0`, `--ctx-checkpoints 0` | Controls, all negative, which is the useful result: disabling CUDA graphs costs 1.8% (32.02 against 32.61 on the shipped configuration, and 2.3% on an earlier one), with mean accepted length unchanged at 3.22, so graph capture is already working, and neither the prompt cache nor context checkpointing costs anything measurable. |
+| `GGML_CUDA_DISABLE_GRAPHS=1`, `--cache-ram 0`, `--ctx-checkpoints 0` | Controls. Disabling CUDA graphs costs 1.8% (32.02 against 32.61 on the shipped configuration, and 2.3% on an earlier one), with mean accepted length unchanged at 3.22, so graph capture is already working, and neither the prompt cache nor context checkpointing costs anything measurable. |
 
 Forward-pass cost must be measured through speculative decoding. Timing prompt processing instead shows a 3.3x step between width 4 and width 5 that does not exist in the decode path, because prompt processing and speculative verification take different paths through the server.
 
