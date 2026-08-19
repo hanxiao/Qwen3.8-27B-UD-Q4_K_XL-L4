@@ -2,23 +2,23 @@
 
 | | |
 | --- | --- |
-| Model | Qwen3.8-27B, [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
-| Weights | `UD-Q4_K_XL`, 5.31 bpw, 16.68 GiB on disk, 15.75 GiB read per forward pass |
+| Model | Qwen3.8-27B, [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), the 2026-08-19 rebuild, 17,559,178,144 bytes |
+| Weights | `UD-Q4_K_XL`, 16.35 GiB on disk, 15.35 GiB read per forward pass |
 | KV cache | `q4_0`, 18 KiB per token across the 16 full-attention layers |
-| Context | **81,664 tokens**, planned by `--fit-target 1792`, not pinned |
-| Decode, prose | **33.3 tok/s** |
-| Decode, seven workloads | **33.1 tok/s** (math 42.9, code 29.8) |
-| Prefill | **645 tok/s** at a 7.8k prompt, 552 at 33k |
-| Mean accepted length | **3.59** tokens per target forward pass, in production |
-| Draft head | `mtp-Qwen3.8-27B-Q4_0.gguf`, output tensor retyped `q2_K`, depth adaptive over 5 to 7, `p-min` 0 |
+| Context | **173,568 tokens**, planned by `--fit-target 1792`, not pinned |
+| Decode, prose | **40.0 tok/s** |
+| Decode, seven workloads | **37.7 tok/s** at the full window, 38.3 at a 32k window (math 48.7, code 28.5) |
+| Prefill | **556 tok/s** at a 22k prompt, 281 at 87k, 188 at 152k |
+| Mean accepted length | **3.63** on the benchmark, **5.51** on GSM8K-shaped prompts, rising to **4.57** at 109k of context |
+| Drafter | [DFlash 2](https://inco.ai/blog/dflash2/) `Q4_K_M`, 1.14 GiB, block drafting at `n-max 7`, `p-min` 0 |
 | Kernel routing | `GGML_MMVQ_MAX=2`, all types on MMQ |
-| Chain drafting | `LLAMA_SPEC_CHAIN=1`, sub-head width 98,304 |
+| Build | llama.cpp [PR #27342](https://github.com/ggml-org/llama.cpp/pull/27342) plus `patches/0001` |
 | Checkpoints | `--ctx-checkpoints 4 --checkpoint-min-step 16384` |
 | Batching | `-ub 512 -b 2048`, `--parallel 1` |
-| GPU | NVIDIA L4 24 GB, ECC off, 72 W cap, 23.3 of 24.0 GiB resident |
+| GPU | NVIDIA L4 24 GB, ECC off, 72 W cap, 22.8 of 24.0 GiB resident |
 | Quality | 40/40 on the arithmetic set, unchanged against `--spec-type none` |
 
-Decode and prefill are `scripts/bench.sh` on the machine `scripts/provision-ondemand.sh` builds. Mean accepted length comes from the `/metrics` endpoint of the served deployment, over 28,049 drafts, where per-position acceptance runs 0.774, 0.607, 0.487, 0.398, 0.325.
+Decode is the seven-workload benchmark, four repetitions, alternated against a control; the run-to-run spread is about 0.4 tok/s. Prefill and the accepted length at depth come from growing a single conversation to 152,361 tokens with the prefix reused, which is the shape the deployment serves. Accepted length is reported per target forward pass, so 3.63 means one verification emits 3.63 tokens.
 
 The table above is the shipped configuration. The sections below give the measurement that fixes each value in it, and the cost model those measurements follow from.
 
@@ -466,6 +466,8 @@ Measured and rejected, so they need not be tried again.
 | Per-quant kernel routing under the block drafter | Worse both ways, and by more than under the native head. At verification width 8 with the target output head read twice per cycle, all types on MMQ gives 36.01 and 35.93 against 34.94 for `Q6_K` on MMVQ and 34.86 for `IQ4_XS` on MMVQ. The routing in Table 4 is tuned for a narrower width and does not survive the move. |
 | `--spec-draft-n-max` above 7 with the block drafter | Nothing, and it is not free. `dflash.block_size` is 8 and `n_draft_max` is `block_size - 1`, so the value is clamped to 7 with a warning. The clamp mutates a copy, while `need_n_rs_seq()` sizes the target recurrent state from the raw value, so `n-max 8` and `n-max 9` draft exactly 7 tokens and spend 299 and 598 MiB of VRAM for it. |
 | `--spec-draft-p-min` with the block drafter | Inert. The DFlash 2 branch returns before the confidence gate is reached, so the value is never read. The block is drafted in full every round. |
+| Two resident stream-k blocks per SM | Monotonically worse. When tiling efficiency is under 90% the launcher sizes the grid at exactly `nsm`, one block per SM, which is 58 blocks of 8 warps on this card and 16.7% occupancy, and shared memory at ~40 KiB against Ada's 100 KiB per SM leaves room for a second block. Making the multiplier a runtime knob and sweeping it gives 38.29 tok/s at one block, 37.11 at two, 35.87 at three and 35.69 at four. Two blocks does lift the worst workload from 29.31 to 31.36, so the occupancy gain is real; it is simply beaten by what the finer K-split costs everywhere else. This closes the cheap half of the MMQ admission fee, and the expensive half needs a different kernel rather than a different launch. |
+| Returning any type to MMVQ on the rebuilt weights | Worse, and the margin grew. The type mix moved by more than two orders of magnitude on some types, so the routing decision was re-taken rather than assumed: all types on MMQ gives 37.74 against 34.37 for `Q6_K` and `IQ4_XS` on MMVQ, and 24.19 with every type on MMVQ. This also retires PR [#26705](https://github.com/ggml-org/llama.cpp/pull/26705), which accelerates the MMVQ unpack by up to 21.7% on this architecture: MMVQ at verification width 8 costs 132.0 ms against MMQ's 90.5, and the patch is inert code under this routing. |
 | `GGML_CUDA_DISABLE_GRAPHS=1`, `--cache-ram 0`, `--ctx-checkpoints 0` | Controls. Disabling CUDA graphs costs 1.8% (32.02 against 32.61 on the shipped configuration, and 2.3% on an earlier one), with mean accepted length unchanged at 3.22, so graph capture is already working, and neither the prompt cache nor context checkpointing costs anything measurable. |
 
 Forward-pass cost must be measured through speculative decoding. Timing prompt processing instead shows a 3.3x step between width 4 and width 5 that does not exist in the decode path, because prompt processing and speculative verification take different paths through the server.
@@ -912,6 +914,43 @@ throughput, so `n-max 7` is kept.
 
 `--fit-target 1792` is kept. 155,136 tokens leaves 1.7 GiB of headroom, and the larger windows are
 validated but spend the margin that the previous configuration needed after two production aborts.
+
+## The 2026-08-19 rebuild of the weights
+
+Unsloth re-cut `UD-Q4_K_XL` under Dynamic 3.0 on 2026-08-19. It is not the same file: 306 of its 866
+tensors changed type, and it is 364 MB smaller while spending more precision where the architecture
+needs it.
+
+| Type | Old file | New file |
+| --- | --- | --- |
+| Q8_0 | 0 | 110 |
+| Q6_K | 19 | 56 |
+| Q5_K | 325 | 191 |
+| Q4_K | 97 | 69 |
+| IQ4_XS | 65 | 70 |
+| IQ4_NL, Q3_K, IQ3_S | 0 | 10 |
+
+The largest single move is the recurrence control projections: 48 `ssm_alpha` and 48 `ssm_beta`
+tensors go `Q4_K` to `Q8_0`. Those are the tensors the earlier comparison against a third-party build
+identified as the ones this architecture is sensitive to, and the model authors have now raised them
+in the reference file.
+
+Measured, changing only the file:
+
+| | Old file | New file |
+| --- | --- | --- |
+| Seven workloads | 36.62 tok/s | **37.86** |
+| json workload | 32.09 | **40.37** |
+| Context at `--fit-target 1792` | 155,136 | **173,568** |
+| GSM8K-shaped accepted length | 5.559 | 5.399 |
+
+It is worth 3.4% of throughput and 18,432 tokens of context at once, and it repairs the one workload
+where the block drafter had been losing. It drafts very slightly worse, which is consistent with the
+recurrence projections moving, and the benchmark mean prefers it by far more than the drafting costs.
+Accuracy is 40/40 on the new file.
+
+Pin the size. The old file is 17,923,394,624 bytes and the new one is 17,559,178,144, and both are
+served under the same name.
 
 ## Files
 
