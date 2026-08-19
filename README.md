@@ -6,12 +6,12 @@
 | Weights | `UD-Q4_K_XL`, 5.31 bpw, 16.68 GiB on disk, 15.75 GiB read per forward pass |
 | KV cache | `q4_0`, 18 KiB per token across the 16 full-attention layers |
 | Context | **81,664 tokens**, planned by `--fit-target 1792`, not pinned |
-| Decode, prose | **34.9 tok/s** |
-| Decode, seven workloads | **32.5 tok/s** (math 43.2, code 24.9) |
+| Decode, prose | **33.3 tok/s** |
+| Decode, seven workloads | **33.1 tok/s** (math 42.9, code 29.8) |
 | Prefill | **645 tok/s** at a 7.8k prompt, 552 at 33k |
 | Mean accepted length | **3.59** tokens per target forward pass, in production |
-| Draft head | `mtp-Qwen3.8-27B-Q4_0.gguf`, output tensor retyped `q2_K`, depth 5, `p-min` 0 |
-| Kernel routing | `GGML_MMVQ_MAX=2`, with `Q6_K` and `IQ4_XS` returned to MMVQ |
+| Draft head | `mtp-Qwen3.8-27B-Q4_0.gguf`, output tensor retyped `q2_K`, depth adaptive over 5 to 7, `p-min` 0 |
+| Kernel routing | `GGML_MMVQ_MAX=2`, all types on MMQ |
 | Chain drafting | `LLAMA_SPEC_CHAIN=1`, sub-head width 98,304 |
 | Checkpoints | `--ctx-checkpoints 4 --checkpoint-min-step 16384` |
 | Batching | `-ub 512 -b 2048`, `--parallel 1` |
@@ -754,6 +754,53 @@ acceptance at position k is conditional on positions 0 through k-1 already match
 Beating a head the model authors trained needs training data at least as broad as theirs. That is
 the constraint on this path, and it is a data problem, not a method or a serving problem.
 
+## Adaptive draft depth
+
+A single draft depth gives up one workload class to serve another. Measured on this card at fixed
+depth, on GSM8K-shaped prompts depth 7 reaches 46.9 tok/s at mean accepted length 4.45 while depth 5
+reaches 43.0 at 3.93, and on the seven-workload benchmark that ordering reverses. The seven-workload
+mean and the worst workload in it disagree the same way, so the depth that maximizes one loses the
+other.
+
+`patches/0002-adaptive-draft-depth.patch` lets the depth follow the workload. The control signal is
+whether the draft was **fully consumed**, not how many tokens were accepted:
+
+| Observation | Meaning | Action |
+| --- | --- | --- |
+| `n_accepted >= n_drafted` | the draft ran out before the target disagreed | depth + 1, capped at `LLAMA_ADAPT_HI` |
+| `n_accepted + slack < n_drafted` | the target rejected well short of the draft | depth - 1, floored at `LLAMA_ADAPT_LO` |
+| otherwise | the depth is where the workload supports it | hold |
+
+An exponential moving average of the accepted count does not work, and the failure is instructive. It
+is a positive feedback loop: accepting more tokens raises the estimate, which drafts deeper, which
+accepts more, so every workload with any acceptance runs to the cap. Measured cost of that version:
+the math workload drafted 391 tokens against 308 for an identical 191 accepted, and lost 5.7%. Full
+consumption is the only evidence that a deeper draft would have paid, which makes the controller
+self-limiting.
+
+| Workload | Fixed depth 5 (tok/s) | Adaptive 5 to 7 (tok/s) |
+| --- | --- | --- |
+| prose | 34.94 | 33.29 |
+| code | 24.54 | 29.76 |
+| json | 32.95 | 32.02 |
+| chat | 26.74 | 27.17 |
+| math | 43.19 | 42.86 |
+| multi | 32.02 | 32.65 |
+| summ | 33.65 | 33.89 |
+| **mean** | **32.58** | **33.09** |
+| **worst** | **24.54** | **27.17** |
+| GSM8K-shaped | 42.83 | 45.79 |
+
+Alternated against the fixed-depth configuration at four repetitions each, the fixed arm returns
+32.62 and 32.54 and the adaptive arm returns 33.12 and 33.12, so the 1.7% is outside the run-to-run
+spread. The worst workload gains 10.4% and GSM8K-shaped prompts 6.9%. Accuracy is 40/40.
+
+Adaptive depth also reverses the per-quant kernel routing. That routing is tuned for one verification
+width, and once the width moves the tuning moves with it: at depth 5 returning `Q6_K` and `IQ4_XS` to
+MMVQ is worth 9% on the math workload, and under adaptive depth the same setting costs 21% on the
+code workload. Holding all types on MMQ is worth more than the routing it gives up, so the two
+settings ship together.
+
 ## Files
 
 | Path | Purpose |
@@ -762,6 +809,7 @@ the constraint on this path, and it is a data problem, not a method or a serving
 | `scripts/startup.sh` | on-instance: ECC off, build llama.cpp, fetch both models, install the systemd unit |
 | `scripts/build-llamacpp.sh` | build a patched, SM89-only llama.cpp anywhere with a CUDA toolkit |
 | `patches/0001-mmvq-runtime-crossover.patch` | adds `GGML_MMVQ_MAX`, the kernel crossover knob |
+| `patches/0002-adaptive-draft-depth.patch` | draft depth follows the workload, gated by `LLAMA_ADAPTIVE_DRAFT` |
 | `scripts/bench.sh` | seven-workload decode benchmark |
 | `scripts/sweep-spec.sh` | speculative decoding parameter sweep; still drives the previous docker path, so point it at `/opt/llama.cpp/build/bin/llama-server` before use |
 | `scripts/max-context.sh` | binary search for the largest usable context; same caveat |

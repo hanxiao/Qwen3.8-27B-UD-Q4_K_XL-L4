@@ -1,0 +1,69 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -15,6 +15,8 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
++#include <cstdlib>
++#include <cmath>
+ #include <iomanip>
+ #include <map>
+ #include <cinttypes>
+@@ -1708,7 +1710,9 @@
+                 common_sampler_reset(smpl);
+ 
+                 // dp.n_max caps the round so the draft fits the remaining context
+-                const int n_chain = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
++                const int n_cap   = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
++                const int n_chain = adapt_depth(n_cap);
++                last_draft = n_chain;
+ 
+                 // deferred rows at or past n_past hold candidates the verify
+                 // rejected; the committed prefix ends at n_past - 1. Drop them.
+@@ -1942,11 +1946,45 @@
+         }
+     }
+ 
++    // Adaptive draft depth. The optimal depth is workload dependent: measured on one L4,
++    // depth 7 beats depth 5 by 9.2% on GSM8K-shaped prompts and loses on a mixed 7-workload bench,
++    // so a single static depth gives up one or the other.
++    //
++    // Keyed on whether the draft is being fully consumed, not on how many tokens were accepted.
++    // An EMA of the accepted count is a positive feedback loop: accepting more raises the estimate,
++    // which drafts deeper, which accepts more, so every workload with any acceptance runs to the cap.
++    // Measured cost of that: math drafted 391 tokens against 308 for identical accepted tokens.
++    // Full consumption means the draft ran out before the target disagreed, which is the only
++    // evidence that a deeper draft would have paid. Truncation well short of the draft is evidence
++    // it would not. That makes the controller self-limiting at the depth the workload supports.
++    mutable int cur_depth = 5;
++    int     last_draft  = 0;
++    bool    adapt_on    = getenv("LLAMA_ADAPTIVE_DRAFT") != nullptr;
++    int     adapt_lo    = getenv("LLAMA_ADAPT_LO")   ? atoi(getenv("LLAMA_ADAPT_LO"))   : 4;
++    int     adapt_hi    = getenv("LLAMA_ADAPT_HI")   ? atoi(getenv("LLAMA_ADAPT_HI"))   : 8;
++    int     adapt_slack = getenv("LLAMA_ADAPT_SLACK")? atoi(getenv("LLAMA_ADAPT_SLACK")): 2;
++
++    int adapt_depth(int n_cap) const {
++        if (!adapt_on) {
++            return n_cap;
++        }
++        cur_depth = std::max(adapt_lo, std::min(adapt_hi, cur_depth));
++        return std::min(cur_depth, n_cap);
++    }
++
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+         }
+ 
++        if (adapt_on && last_draft > 0) {
++            if ((int) n_accepted >= last_draft) {
++                if (cur_depth < adapt_hi) cur_depth++;          // draft was exhausted, try deeper
++            } else if ((int) n_accepted + adapt_slack < last_draft) {
++                if (cur_depth > adapt_lo) cur_depth--;          // rejected well short, back off
++            }
++        }
++
+         const int32_t n_rows = verify_h_rows[seq_id];
+         if (n_rows <= 0) {
+             return;
