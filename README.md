@@ -730,7 +730,6 @@ production figure is workload mix, not truncated context.
 | `tools/bandwidth-probe.cu` | measure achievable DRAM bandwidth; used to separate the power tax from kernel slack |
 | `tools/capture-mtp-data.cpp` | capture MTP draft-head training data at prefill speed, for the drafter project the ceiling analysis points to |
 | `tools/mtp_head_reference.py` | torch forward pass for the nextn draft head, matching `src/models/qwen35.cpp` |
-
 | `scripts/start.sh` | restart a stopped instance, retrying through STOCKOUT |
 | `scripts/teardown.sh` | stop or delete |
 
