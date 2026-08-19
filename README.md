@@ -676,6 +676,45 @@ When `/health` never comes up, the boot log carries the reason:
 gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -80 /var/log/qwen-startup.log'
 ```
 
+## Draft head reference implementation
+
+The throughput ceiling section shows the one remaining lever is a draft head with a higher accepted
+length, and that is a training project. Training needs the head to run outside llama.cpp.
+`tools/mtp_head_reference.py` is that forward pass, and it scores **68.8% top-1** on tok_{i+2} given
+(h_i, tok_{i+1}), against 0.774 acceptance at draft position 0 in production.
+
+Two conventions in this checkpoint are not visible from the HF files, and both are silent:
+
+| Convention | Detail |
+| --- | --- |
+| RMSNorm weights are offsets | The effective scale is `1 + w`. `convert_hf_to_gguf.py` bakes the +1 in, so the GGUF tensor equals the HF tensor plus 1.0 exactly on all seven norms of this block |
+| `q_proj` packs two things | Q and the attention gate are interleaved per head at `head_dim * 2` stride |
+
+The first one is not a subtle numerical difference. `mtp.pre_fc_norm_embedding` is 100% negative in
+the HF checkpoint at mean -0.4606, and `mtp.pre_fc_norm_hidden` is 96.1% negative, so a port that
+uses `w` where the model means `1 + w` negates both block inputs at the first operation. The measured
+result is 0.0% top-1 with the true token at median rank 247,841 of 248,320, anti-correlated rather
+than scattered. Applying the convention moves that to 68.8% with no other change.
+
+Nothing upstream catches this. transformers declares
+`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`, so these tensors are never loaded there and no
+reference implementation exercises them.
+
+The diagnostic that isolated it is worth reusing on any ported block: trace
+`cos(stage_output, h)` at every stage. The sign flip appears at the first norm, where
+`cos(h_norm, h)` is -0.899, which points at a scale convention rather than at graph structure.
+
+| Setting | Value | Margin over the alternative |
+| --- | --- | --- |
+| RoPE style | rotate_half | 68.8% against 15.8% |
+| Q and gate split | interleaved | 68.8% against 16.7% |
+| `rope_theta` | 10,000,000 | |
+| Rotary dims | 64 of 256, `partial_rotary_factor` 0.25 | |
+| `mrope_section` | `[11, 11, 10]`, 32 pairs, equal to standard RoPE for text-only input | |
+
+Top-1 is flat at 66 to 69% across causal warmup depths of 32 through 1,536, so the gap to the
+production figure is workload mix, not truncated context.
+
 ## Files
 
 | Path | Purpose |
@@ -690,10 +729,12 @@ gcloud compute ssh qwen38-27b-l4-od --zone=$ZONE --command 'sudo tail -80 /var/l
 | `scripts/verify-quality.sh` | determinism and accuracy checks |
 | `tools/bandwidth-probe.cu` | measure achievable DRAM bandwidth; used to separate the power tax from kernel slack |
 | `tools/capture-mtp-data.cpp` | capture MTP draft-head training data at prefill speed, for the drafter project the ceiling analysis points to |
+| `tools/mtp_head_reference.py` | torch forward pass for the nextn draft head, matching `src/models/qwen35.cpp` |
 
-`capture-mtp-data.cpp` is built and validated, not aspirational, but it comes with a constraint worth knowing before anyone plans the drafter project around it. Compiled against the installed libraries and run over 4,000 positions, it emits exact, self-consistent records: the argmax equals the top-1 id in all of them, the hidden states are fully dense at 5,120 nonzero components, and there is no ragged tail. The catch is volume. Each position stores a bf16 hidden state, so a record is **10,308 bytes**, of which the top-K logits are only 64. That is 10.3 GB per million tokens. The published recipes regenerate 12,000 to 40,000 answers, which at a few hundred tokens each is 6M to 20M tokens, or 62 to 206 GB - against 29 GB free on the 120 GB boot disk this repository provisions. Capturing at that scale therefore needs a larger disk, or capture and training fused into one process so the hidden states are consumed and discarded, or the hidden state stored at lower precision than bf16. Sizing this in advance is cheaper than discovering it 40 GB into a run.
 | `scripts/start.sh` | restart a stopped instance, retrying through STOCKOUT |
 | `scripts/teardown.sh` | stop or delete |
+
+`capture-mtp-data.cpp` emits exact, self-consistent records: the argmax equals the top-1 id in all of them, the hidden states are fully dense at 5,120 nonzero components, and there is no ragged tail. Each position stores a bf16 hidden state, so a record is **10,312 bytes**, of which the top-K logits are only 64. That is 10.3 GB per million tokens, which is why `provision-ondemand.sh` takes a `DISK` knob. A capture of 5,056,189 positions occupies 48.56 GB and takes 2h51m of L4 time.
 
 ## Related
 
