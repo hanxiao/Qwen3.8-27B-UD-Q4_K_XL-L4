@@ -1,6 +1,26 @@
 # Qwen3.8-27B · UD-Q4_K_XL · NVIDIA L4
 
-Qwen3.8-27B serves at 32.5 tok/s decode over an 81,664-token context on a single NVIDIA L4 24 GB, using the [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and llama.cpp with MTP speculative decoding. The weights are `UD-Q4_K_XL` and the KV cache is q4_0, and accuracy is unchanged against the unquantized reference.
+| | |
+| --- | --- |
+| Model | Qwen3.8-27B, [Unsloth Dynamic v3.0 `UD-Q4_K_XL` GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
+| Weights | `UD-Q4_K_XL`, 5.31 bpw, 16.68 GiB on disk, 15.75 GiB read per forward pass |
+| KV cache | `q4_0`, 18 KiB per token across the 16 full-attention layers |
+| Context | **81,664 tokens**, planned by `--fit-target 1792`, not pinned |
+| Decode, prose | **34.9 tok/s** |
+| Decode, seven workloads | **32.5 tok/s** (math 43.2, code 24.9) |
+| Prefill | **645 tok/s** at a 7.8k prompt, 552 at 33k |
+| Mean accepted length | **3.59** tokens per target forward pass, in production |
+| Draft head | `mtp-Qwen3.8-27B-Q4_0.gguf`, output tensor retyped `q2_K`, depth 5, `p-min` 0 |
+| Kernel routing | `GGML_MMVQ_MAX=2`, with `Q6_K` and `IQ4_XS` returned to MMVQ |
+| Chain drafting | `LLAMA_SPEC_CHAIN=1`, sub-head width 98,304 |
+| Checkpoints | `--ctx-checkpoints 4 --checkpoint-min-step 16384` |
+| Batching | `-ub 512 -b 2048`, `--parallel 1` |
+| GPU | NVIDIA L4 24 GB, ECC off, 72 W cap, 23.3 of 24.0 GiB resident |
+| Quality | 40/40 on the arithmetic set, unchanged against `--spec-type none` |
+
+Decode and prefill are `scripts/bench.sh` on the machine `scripts/provision-ondemand.sh` builds. Mean accepted length comes from the `/metrics` endpoint of the served deployment, over 28,049 drafts, where per-position acceptance runs 0.774, 0.607, 0.487, 0.398, 0.325.
+
+The table above is the shipped configuration. The sections below give the measurement that fixes each value in it, and the cost model those measurements follow from.
 
 ```bash
 gcloud config set project <your-project>
