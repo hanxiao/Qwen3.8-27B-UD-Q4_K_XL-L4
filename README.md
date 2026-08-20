@@ -539,6 +539,14 @@ A fixed benchmark replays a fixed set of shapes and never reaches this. The 40-p
 
 ### Context ceiling
 
+This subsection measures the context ceiling of the native-head configuration, and its numbers are
+superseded by the sweep further down. Two of its findings are specific to that drafter and do **not**
+carry over: the window it can plan for is roughly half, because the native head's draft context keeps
+a KV cache that scales with the target context, and VRAM there grows 12.25 KiB per resident token
+where under the block drafter it is flat at every depth measured. What does carry over, and is the
+reason the sweep below exists at all, is the distinction between a window the planner grants and a
+window that survives varied batch shapes.
+
 Sixteen of the 64 layers keep a KV cache. The other 48 are Gated DeltaNet and carry a fixed recurrent state that does not grow with context. Those 16 layers cost 64 KiB per token at f16, so the cache type sets how much context a given amount of memory buys.
 
 The cache is not the only claim on that memory. llama.cpp allocates a compute graph buffer inside `llama_context::decode`, sized by batch shape, after the model and the cache are already resident. A context size chosen by loading the server and exercising it can therefore serve correctly and still exhaust the device later, when a batch shape that was never exercised needs a larger buffer:
@@ -587,7 +595,7 @@ llama_context::decode -> process_ubatch -> ggml_gallocr_alloc_graph
 ggml_backend_cuda_buffer_type_alloc_buffer: allocating 258.69 MiB on device 0: cudaMalloc failed
 ```
 
-Sizing for that growth rather than against it gives the shipped configuration: `--fit-target 1792` for 81,664 tokens, which leaves about 2.1 GiB free once the window is full. Filled to depth 77,023 with prompt lengths varied across turns, it holds that margin and answers a request past the ceiling with HTTP 400 instead of aborting. `--ctx-checkpoints 4 --checkpoint-min-step 16384` bounds the recurrent-state copies a long conversation accumulates.
+Sizing for that growth rather than against it gave the native-head configuration `--fit-target 1792` for 81,664 tokens, which leaves about 2.1 GiB free once the window is full. Filled to depth 77,023 with prompt lengths varied across turns, it holds that margin and answers a request past the ceiling with HTTP 400 instead of aborting. `--ctx-checkpoints 4 --checkpoint-min-step 16384` bounds the recurrent-state copies a long conversation accumulates.
 
 **Table 16: what a granted context leaves free once it is full.**
 
