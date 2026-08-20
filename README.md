@@ -6,9 +6,9 @@
 | Weights | `UD-Q4_K_XL`, 16.35 GiB on disk, 15.35 GiB read per forward pass |
 | KV cache | `q4_0`, 18 KiB per token across the 16 full-attention layers |
 | Context | **226,048 tokens**, planned by `--fit-target 768 -ub 256`, not pinned |
-| Decode, prose | **40.0 tok/s** |
-| Decode, seven workloads | **37.7 tok/s** at the full window, 38.3 at a 32k window (math 48.7, code 28.5) |
-| Prefill | **556 tok/s** at a 22k prompt, 281 at 87k, 188 at 152k |
+| Decode, prose | **39.4 tok/s** |
+| Decode, seven workloads | **37.4 tok/s** at the served window, 38.3 at a 32k window (math 48.2, code 28.4) |
+| Prefill | **579 tok/s** at a 7k prompt, 514 at 33k, 387 at 79k |
 | Mean accepted length | **3.63** on the benchmark, **5.51** on GSM8K-shaped prompts, rising to **4.57** at 109k of context |
 | Drafter | [DFlash 2](https://inco.ai/blog/dflash2/) `Q4_K_M`, 1.14 GiB, block drafting at `n-max 7`, `p-min` 0 |
 | Kernel routing | `GGML_MMVQ_MAX=2`, all types on MMQ |
