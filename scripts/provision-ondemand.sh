@@ -30,7 +30,8 @@ PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
 DISK="${DISK:-120}"
 FIT_TARGET="${FIT_TARGET:-768}"
 KV="${KV:-q4_0}"
-NMAX="${NMAX:-5}"
+NMAX="${NMAX:-7}"
+UB="${UB:-256}"
 MMVQ_MAX="${MMVQ_MAX:-2}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -73,7 +74,7 @@ for z in $ZONES; do
       --image-project=deeplearning-platform-release \
       --boot-disk-size=${DISK}GB --boot-disk-type=pd-ssd \
       --tags="$NET_TAG" \
-      --metadata="qwen-fit-target=$FIT_TARGET,qwen-kv=$KV,qwen-nmax=$NMAX,qwen-mmvq-max=$MMVQ_MAX" \
+      --metadata="qwen-fit-target=$FIT_TARGET,qwen-kv=$KV,qwen-nmax=$NMAX,qwen-ub=$UB,qwen-mmvq-max=$MMVQ_MAX" \
       --metadata-from-file="$META" 2>&1 | tail -3; then
     ZONE="$z"; break
   fi
